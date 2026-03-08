@@ -33,6 +33,13 @@ except ImportError:
 from cosyvoice.utils.frontend_utils import contains_chinese, replace_blank, replace_corner_mark, remove_bracket, spell_out_number, split_paragraph
 
 
+def _build_wetext_normalizers():
+    return (
+        ZhNormalizer(remove_erhua=False, full_to_half=False),
+        EnNormalizer(),
+    )
+
+
 class CosyVoiceFrontEnd:
 
     def __init__(self,
@@ -41,6 +48,7 @@ class CosyVoiceFrontEnd:
                  model_dir: str,
                  campplus_model: str,
                  speech_tokenizer_model: str,
+                 ttsfrd_resource_dir: str = '',
                  spk2info: str = '',
                  instruct: bool = False,
                  allowed_special: str = 'all'):
@@ -59,15 +67,20 @@ class CosyVoiceFrontEnd:
         self.inflect_parser = inflect.engine()
         self.use_ttsfrd = use_ttsfrd
         if self.use_ttsfrd:
-            self.frd = ttsfrd.TtsFrontendEngine()
-            ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-            assert self.frd.initialize('{}/CosyVoice-ttsfrd/resource'.format(model_dir)) is True, 'failed to initialize ttsfrd resource'
-            self.frd.set_lang_type('pinyin')
-            self.frd.enable_pinyin_mix(True)
-            self.frd.set_breakmodel_index(1)
+            try:
+                self.frd = ttsfrd.TtsFrontendEngine()
+                resource_dir = ttsfrd_resource_dir or '{}/CosyVoice-ttsfrd/resource'.format(model_dir)
+                if self.frd.initialize(resource_dir) is not True:
+                    raise RuntimeError('failed to initialize ttsfrd resource')
+                self.frd.set_lang_type('pinyin')
+                self.frd.enable_pinyin_mix(True)
+                self.frd.set_breakmodel_index(1)
+            except Exception as exc:
+                print(f"failed to initialize ttsfrd resource, use WeTextProcessing instead: {exc}")
+                self.use_ttsfrd = False
+                self.zh_tn_model, self.en_tn_model = _build_wetext_normalizers()
         else:
-            self.zh_tn_model = ZhNormalizer(remove_erhua=False, full_to_half=False)
-            self.en_tn_model = EnNormalizer()
+            self.zh_tn_model, self.en_tn_model = _build_wetext_normalizers()
 
     def _extract_text_token(self, text):
         text_token = self.tokenizer.encode(text, allowed_special=self.allowed_special)

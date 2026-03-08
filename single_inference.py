@@ -199,7 +199,7 @@ class CustomCosyVoiceModel(CosyVoiceModel):
 ###CosyVoice
 class CustomCosyVoice:
 
-    def __init__(self, model_dir):
+    def __init__(self, model_dir, ttsfrd_resource_dir: str = ""):
         #assert os.path.exists(model_dir), f"model path '{model_dir}' not exist, please check the path: pretrained_models/CosyVoice-300M-zhtw"
         instruct = False
         
@@ -215,6 +215,7 @@ class CustomCosyVoice:
                                           model_dir,
                                           '{}/campplus.onnx'.format(model_dir),
                                           '{}/speech_tokenizer_v1.onnx'.format(model_dir),
+                                          ttsfrd_resource_dir,
                                           '{}/spk2info.pt'.format(model_dir),
                                           instruct,
                                           configs['allowed_special'])
@@ -353,6 +354,161 @@ def parse_transcript(text, end):
     parsed_output = "".join([p[2] for p in parsed_output])
     return parsed_output, start
 
+
+_STRONG_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？?!；;])\s*")
+_WEAK_SENTENCE_SPLIT_RE = re.compile(r"(?<=[，、,：:])\s*")
+_MULTISPACE_RE = re.compile(r"\s+")
+
+
+def _normalize_chunk_text(text):
+    if not isinstance(text, str):
+        return ""
+    normalized = _MULTISPACE_RE.sub(" ", text).strip()
+    normalized = normalized.replace(" ,", "，").replace(" .", "。")
+    normalized = normalized.replace(" ?", "？").replace(" !", "！")
+    return normalized
+
+
+def _split_long_chunk(text, max_chars=80):
+    text = _normalize_chunk_text(text)
+    if len(text) <= max_chars:
+        return [text] if text else []
+
+    pieces = []
+    remainder = text
+    while len(remainder) > max_chars:
+        split_at = -1
+        window = remainder[:max_chars + 1]
+        for delimiter in ["，", "、", "：", "；", ",", ":", ";", " "]:
+            candidate = window.rfind(delimiter)
+            if candidate > split_at:
+                split_at = candidate
+
+        if split_at <= 0:
+            split_at = max_chars
+        else:
+            split_at += 1
+
+        piece = _normalize_chunk_text(remainder[:split_at])
+        if piece:
+            pieces.append(piece)
+        remainder = _normalize_chunk_text(remainder[split_at:])
+
+    if remainder:
+        pieces.append(remainder)
+    return pieces
+
+
+def _split_tts_content(text, max_chars=80):
+    normalized = _normalize_chunk_text(text)
+    if not normalized:
+        return []
+
+    rough_chunks = [chunk for chunk in _STRONG_SENTENCE_SPLIT_RE.split(normalized) if chunk]
+    if not rough_chunks:
+        rough_chunks = [normalized]
+
+    chunks = []
+    for rough_chunk in rough_chunks:
+        rough_chunk = _normalize_chunk_text(rough_chunk)
+        if not rough_chunk:
+            continue
+
+        if len(rough_chunk) <= max_chars:
+            chunks.append(rough_chunk)
+            continue
+
+        weak_chunks = [chunk for chunk in _WEAK_SENTENCE_SPLIT_RE.split(rough_chunk) if chunk]
+        if len(weak_chunks) <= 1:
+            chunks.extend(_split_long_chunk(rough_chunk, max_chars=max_chars))
+            continue
+
+        current = ""
+        for weak_chunk in weak_chunks:
+            weak_chunk = _normalize_chunk_text(weak_chunk)
+            if not weak_chunk:
+                continue
+            candidate = weak_chunk if not current else current + weak_chunk
+            if len(candidate) <= max_chars:
+                current = candidate
+                continue
+
+            if current:
+                chunks.append(current)
+            if len(weak_chunk) <= max_chars:
+                current = weak_chunk
+            else:
+                chunks.extend(_split_long_chunk(weak_chunk, max_chars=max_chars))
+                current = ""
+
+        if current:
+            chunks.append(current)
+
+    merged_chunks = []
+    for chunk in chunks:
+        chunk = _normalize_chunk_text(chunk)
+        if not chunk:
+            continue
+        if merged_chunks and len(chunk) < 8 and len(merged_chunks[-1]) + len(chunk) <= max_chars:
+            merged_chunks[-1] += chunk
+        else:
+            merged_chunks.append(chunk)
+    return merged_chunks
+
+
+def _pause_samples_for_chunk(text, sample_rate=22050):
+    trailing = text[-1] if text else ""
+    if trailing in "。！？?!；;":
+        return int(sample_rate * 0.18)
+    if trailing in "，、,:：":
+        return int(sample_rate * 0.10)
+    return int(sample_rate * 0.06)
+
+
+def _trim_waveform_silence(
+    waveform,
+    sample_rate=22050,
+    threshold=0.003,
+    keep_leading_sec=0.02,
+    keep_trailing_sec=0.04,
+    trim_leading=True,
+    trim_trailing=True,
+):
+    if waveform.numel() == 0:
+        return waveform
+
+    if waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)
+
+    amplitude = waveform.abs().amax(dim=0)
+    voiced_indices = torch.nonzero(amplitude > threshold, as_tuple=False).flatten()
+    if voiced_indices.numel() == 0:
+        return waveform
+
+    keep_leading = int(sample_rate * keep_leading_sec)
+    keep_trailing = int(sample_rate * keep_trailing_sec)
+    if trim_leading:
+        start = max(0, int(voiced_indices[0].item()) - keep_leading)
+    else:
+        start = 0
+
+    if trim_trailing:
+        end = min(waveform.shape[1], int(voiced_indices[-1].item()) + keep_trailing + 1)
+    else:
+        end = waveform.shape[1]
+
+    return waveform[:, start:end]
+
+
+def _append_tail_silence(waveform, sample_rate=22050, tail_sec=0.35):
+    if waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)
+    tail = torch.zeros(
+        (waveform.shape[0], int(sample_rate * tail_sec)),
+        dtype=waveform.dtype,
+    )
+    return torch.cat([waveform, tail], dim=1)
+
 def single_inference(speaker_prompt_audio_path, content_to_synthesize, output_path, cosyvoice, bopomofo_converter, speaker_prompt_text_transcription=None):
     prompt_speech_16k = load_wav(speaker_prompt_audio_path, 16000)
     content_to_synthesize = content_to_synthesize
@@ -376,12 +532,37 @@ def single_inference(speaker_prompt_audio_path, content_to_synthesize, output_pa
     )
     speaker_prompt_text_transcription_bopomo = get_bopomofo_rare(speaker_prompt_text_transcription, bopomofo_converter)
     print("Speaker prompt audio transcription:",speaker_prompt_text_transcription_bopomo)
-    
-    #print("Content to be synthesized before bopomofo:",content_to_synthesize)
-    content_to_synthesize_bopomo = get_bopomofo_rare(content_to_synthesize, bopomofo_converter)
-    print("Content to be synthesized:",content_to_synthesize_bopomo)
+
+    content_chunks = _split_tts_content(content_to_synthesize, max_chars=80)
+    if not content_chunks:
+        raise ValueError("content_to_synthesize is empty after normalization")
+
+    print("Content chunks:", content_chunks)
     start = time.time()
-    output = cosyvoice.inference_zero_shot_no_normalize(content_to_synthesize_bopomo, speaker_prompt_text_transcription_bopomo, prompt_speech_16k)
+    chunk_audios = []
+    for chunk_index, content_chunk in enumerate(content_chunks, start=1):
+        content_to_synthesize_bopomo = get_bopomofo_rare(content_chunk, bopomofo_converter)
+        print(f"Content chunk {chunk_index}/{len(content_chunks)}:", content_to_synthesize_bopomo)
+        output = cosyvoice.inference_zero_shot_no_normalize(
+            content_to_synthesize_bopomo,
+            speaker_prompt_text_transcription_bopomo,
+            prompt_speech_16k,
+        )
+        is_last_chunk = chunk_index == len(content_chunks)
+        trimmed_chunk = _trim_waveform_silence(
+            output["tts_speech"],
+            keep_trailing_sec=0.10 if not is_last_chunk else 0.20,
+            trim_trailing=not is_last_chunk,
+        )
+        chunk_audios.append(trimmed_chunk)
+        if not is_last_chunk:
+            pause = torch.zeros(
+                (1, _pause_samples_for_chunk(content_chunk)),
+                dtype=trimmed_chunk.dtype,
+            )
+            chunk_audios.append(pause)
+
+    output = {"tts_speech": _append_tail_silence(torch.cat(chunk_audios, dim=1))}
     end = time.time()
     print("Elapsed time:",end - start)
     print("Generated audio length:", output['tts_speech'].shape[1]/22050, "seconds")
@@ -398,10 +579,11 @@ def main():
     parser.add_argument("--output_path", type=str, required=False, default="results/output.wav", help="Specifies the name and path for the output .wav file.")
     
     parser.add_argument("--model_path", type=str, required=False, default = "MediaTek-Research/BreezyVoice-300M",help="Specifies the model used for speech synthesis.")
+    parser.add_argument("--ttsfrd_resource_dir", type=str, required=False, default="", help="Optional path to CosyVoice-ttsfrd/resource.")
     args = parser.parse_args()
     
     
-    cosyvoice = CustomCosyVoice(args.model_path)
+    cosyvoice = CustomCosyVoice(args.model_path, args.ttsfrd_resource_dir)
 
     bopomofo_converter = G2PWConverter()
 
