@@ -22,15 +22,11 @@ import torchaudio
 import os
 import re
 import inflect
-try:
-    import ttsfrd
-    use_ttsfrd = True
-except ImportError:
-    print("failed to import ttsfrd, use WeTextProcessing instead")
-    from tn.chinese.normalizer import Normalizer as ZhNormalizer
-    from tn.english.normalizer import Normalizer as EnNormalizer
-    use_ttsfrd = False
+from tn.chinese.normalizer import Normalizer as ZhNormalizer
+from tn.english.normalizer import Normalizer as EnNormalizer
 from cosyvoice.utils.frontend_utils import contains_chinese, replace_blank, replace_corner_mark, remove_bracket, spell_out_number, split_paragraph
+
+use_ttsfrd = False
 
 
 def _build_wetext_normalizers():
@@ -65,22 +61,8 @@ class CosyVoiceFrontEnd:
         self.instruct = instruct
         self.allowed_special = allowed_special
         self.inflect_parser = inflect.engine()
+        self.zh_tn_model, self.en_tn_model = _build_wetext_normalizers()
         self.use_ttsfrd = use_ttsfrd
-        if self.use_ttsfrd:
-            try:
-                self.frd = ttsfrd.TtsFrontendEngine()
-                resource_dir = ttsfrd_resource_dir or '{}/CosyVoice-ttsfrd/resource'.format(model_dir)
-                if self.frd.initialize(resource_dir) is not True:
-                    raise RuntimeError('failed to initialize ttsfrd resource')
-                self.frd.set_lang_type('pinyin')
-                self.frd.enable_pinyin_mix(True)
-                self.frd.set_breakmodel_index(1)
-            except Exception as exc:
-                print(f"failed to initialize ttsfrd resource, use WeTextProcessing instead: {exc}")
-                self.use_ttsfrd = False
-                self.zh_tn_model, self.en_tn_model = _build_wetext_normalizers()
-        else:
-            self.zh_tn_model, self.en_tn_model = _build_wetext_normalizers()
 
     def _extract_text_token(self, text):
         text_token = self.tokenizer.encode(text, allowed_special=self.allowed_special)

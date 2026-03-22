@@ -3,9 +3,9 @@ import os
 import sys
 import re
 from functools import partial
-import time
 
 import torch
+
 torch.set_num_threads(1)
 import torchaudio
 import torchaudio.functional as F
@@ -19,81 +19,115 @@ from cosyvoice.cli.frontend import CosyVoiceFrontEnd
 from cosyvoice.cli.model import CosyVoiceModel
 from cosyvoice.cli.cosyvoice import CosyVoice
 from cosyvoice.utils.file_utils import load_wav
-from cosyvoice.utils.frontend_utils import (contains_chinese, replace_blank, replace_corner_mark,remove_bracket, spell_out_number, split_paragraph)
+from cosyvoice.utils.frontend_utils import (
+    contains_chinese,
+    replace_blank,
+    replace_corner_mark,
+    remove_bracket,
+    spell_out_number,
+    split_paragraph,
+)
 from utils.word_utils import word_to_dataset_frequency, char2phn, always_augment_chars
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.append('{}/third_party/Matcha-TTS'.format(ROOT_DIR))
+sys.path.append("{}/third_party/Matcha-TTS".format(ROOT_DIR))
+
 
 ####new normalize
 class CustomCosyVoiceFrontEnd(CosyVoiceFrontEnd):
-    def text_normalize_new(self,text, split=False):
+    def text_normalize_new(self, text, split=False):
         text = text.strip()
+        if not text:
+            return text
+
         def split_by_brackets(input_string):
             # Use regex to find text inside and outside the brackets
-            inside_brackets = re.findall(r'\[(.*?)\]', input_string)
-            outside_brackets = re.split(r'\[.*?\]', input_string)
-            
+            inside_brackets = re.findall(r"\[(.*?)\]", input_string)
+            outside_brackets = re.split(r"\[.*?\]", input_string)
+
             # Filter out empty strings from the outside list (result of consecutive brackets)
             outside_brackets = [part for part in outside_brackets if part]
-            
+
             return inside_brackets, outside_brackets
-        
+
+        def normalize_with_fallback(input_text, is_chinese):
+            normalized = ""
+            if self.use_ttsfrd:
+                try:
+                    normalized = self.frd.get_frd_extra_info(input_text, "input") or ""
+                    normalized = normalized.strip()
+                except Exception as exc:
+                    print(
+                        f"ttsfrd normalize failed, fallback to WeTextProcessing: {exc}"
+                    )
+                    normalized = ""
+
+            if normalized:
+                return normalized
+
+            if self.use_ttsfrd:
+                print(
+                    "ttsfrd normalization returned empty, fallback to WeTextProcessing"
+                )
+
+            if is_chinese:
+                return self.zh_tn_model.normalize(input_text)
+            return self.en_tn_model.normalize(input_text)
+
         def text_normalize_no_split(text, is_last=False):
             text = text.strip()
+            if not text:
+                return text
             text_is_terminated = text[-1] == "。"
             if contains_chinese(text):
-                #print(text)
-                if self.use_ttsfrd:
-                    text = self.frd.get_frd_extra_info(text, 'input')
-                else:
-                    text = self.zh_tn_model.normalize(text)
-                if not text_is_terminated and not is_last:
+                # print(text)
+                text = normalize_with_fallback(text, is_chinese=True)
+                if text and not text_is_terminated and not is_last:
                     text = text[:-1]
-                #print(text)
+                # print(text)
                 text = text.replace("\n", "")
                 text = replace_blank(text)
                 text = replace_corner_mark(text)
                 text = text.replace(".", "、")
-                #print(text)
+                # print(text)
                 text = text.replace(" - ", "，")
-                #print(text)
+                # print(text)
                 text = remove_bracket(text)
-                #print(text)
-                text = re.sub(r'[，,]+$', '。', text)
-                #print(text)
+                # print(text)
+                text = re.sub(r"[，,]+$", "。", text)
+                # print(text)
             else:
-                if self.use_ttsfrd:
-                    text = self.frd.get_frd_extra_info(text, 'input')
-                else:
-                    text = self.en_tn_model.normalize(text)
+                text = normalize_with_fallback(text, is_chinese=False)
                 text = spell_out_number(text, self.inflect_parser)
             return text
-        
+
         def join_interleaved(outside, inside):
             # Ensure the number of parts match between outside and inside
             result = []
-            
+
             # Iterate and combine alternating parts
             for o, i in zip(outside, inside):
-                result.append(o + '[' + i + ']')
-            
+                result.append(o + "[" + i + "]")
+
             # Append any remaining part (if outside is longer than inside)
             if len(outside) > len(inside):
                 result.append(outside[-1])
-            
-            return ''.join(result)
+
+            return "".join(result)
+
         inside_brackets, outside_brackets = split_by_brackets(text)
-        #print("io",inside_brackets, outside_brackets)
-        #text = re.sub(r'(\[[^\]]*\])(.*?)', normalize_outside_brackets, text)
-        #print(text)
+        # print("io",inside_brackets, outside_brackets)
+        # text = re.sub(r'(\[[^\]]*\])(.*?)', normalize_outside_brackets, text)
+        # print(text)
         for n in range(len(outside_brackets)):
-            e_out = text_normalize_no_split(outside_brackets[n],is_last = n == len(outside_brackets) - 1)
+            e_out = text_normalize_no_split(
+                outside_brackets[n], is_last=n == len(outside_brackets) - 1
+            )
             outside_brackets[n] = e_out
-            
+
         text = join_interleaved(outside_brackets, inside_brackets)
-        #print()
-            
+        # print()
+
         # if contains_chinese(text):
         #     texts = [i for i in split_paragraph(
         #         text, partial(self.tokenizer.encode, allowed_special=self.allowed_special),
@@ -108,52 +142,85 @@ class CustomCosyVoiceFrontEnd(CosyVoiceFrontEnd):
         if split is False:
             return text
         return texts
-    
+
     def frontend_zero_shot(self, tts_text, prompt_text, prompt_speech_16k):
         tts_text_token, tts_text_token_len = self._extract_text_token(tts_text)
         prompt_text_token, prompt_text_token_len = self._extract_text_token(prompt_text)
-        prompt_speech_22050 = torchaudio.transforms.Resample(orig_freq=16000, new_freq=22050)(prompt_speech_16k)
+        prompt_speech_22050 = torchaudio.transforms.Resample(
+            orig_freq=16000, new_freq=22050
+        )(prompt_speech_16k)
         speech_feat, speech_feat_len = self._extract_speech_feat(prompt_speech_22050)
         speech_token, speech_token_len = self._extract_speech_token(prompt_speech_16k)
         embedding = self._extract_spk_embedding(prompt_speech_16k)
-        model_input = {'text': tts_text_token, 'text_len': tts_text_token_len,
-                       'prompt_text': prompt_text_token, 'prompt_text_len': prompt_text_token_len,
-                       'llm_prompt_speech_token': speech_token, 'llm_prompt_speech_token_len': speech_token_len,
-                       'flow_prompt_speech_token': speech_token, 'flow_prompt_speech_token_len': speech_token_len,
-                       'prompt_speech_feat': speech_feat, 'prompt_speech_feat_len': speech_feat_len,
-                       'llm_embedding': embedding, 'flow_embedding': embedding}
+        model_input = {
+            "text": tts_text_token,
+            "text_len": tts_text_token_len,
+            "prompt_text": prompt_text_token,
+            "prompt_text_len": prompt_text_token_len,
+            "llm_prompt_speech_token": speech_token,
+            "llm_prompt_speech_token_len": speech_token_len,
+            "flow_prompt_speech_token": speech_token,
+            "flow_prompt_speech_token_len": speech_token_len,
+            "prompt_speech_feat": speech_feat,
+            "prompt_speech_feat_len": speech_feat_len,
+            "llm_embedding": embedding,
+            "flow_embedding": embedding,
+        }
         return model_input
-    
-    def frontend_zero_shot_dual(self, tts_text, prompt_text, prompt_speech_16k, flow_prompt_text, flow_prompt_speech_16k):
+
+    def frontend_zero_shot_dual(
+        self,
+        tts_text,
+        prompt_text,
+        prompt_speech_16k,
+        flow_prompt_text,
+        flow_prompt_speech_16k,
+    ):
         tts_text_token, tts_text_token_len = self._extract_text_token(tts_text)
         prompt_text_token, prompt_text_token_len = self._extract_text_token(prompt_text)
-        flow_prompt_text_token, flow_prompt_text_token_len = self._extract_text_token(flow_prompt_text)
-        flow_prompt_speech_22050 = torchaudio.transforms.Resample(orig_freq=16000, new_freq=22050)(flow_prompt_speech_16k)
-        speech_feat, speech_feat_len = self._extract_speech_feat(flow_prompt_speech_22050)
-        
-        flow_speech_token, flow_speech_token_len = self._extract_speech_token(flow_prompt_speech_16k)
-        #speech_token, speech_token_len = self._extract_speech_token(prompt_speech_16k)
+        flow_prompt_text_token, flow_prompt_text_token_len = self._extract_text_token(
+            flow_prompt_text
+        )
+        flow_prompt_speech_22050 = torchaudio.transforms.Resample(
+            orig_freq=16000, new_freq=22050
+        )(flow_prompt_speech_16k)
+        speech_feat, speech_feat_len = self._extract_speech_feat(
+            flow_prompt_speech_22050
+        )
+
+        flow_speech_token, flow_speech_token_len = self._extract_speech_token(
+            flow_prompt_speech_16k
+        )
+        # speech_token, speech_token_len = self._extract_speech_token(prompt_speech_16k)
         speech_token = flow_speech_token.clone()
         speech_token_len = flow_speech_token_len.clone()
         embedding = self._extract_spk_embedding(prompt_speech_16k)
-        #flow_embedding = self._extract_spk_embedding(flow_prompt_speech_16k)
+        # flow_embedding = self._extract_spk_embedding(flow_prompt_speech_16k)
         flow_embedding = embedding.clone()
-        model_input = {'text': tts_text_token, 'text_len': tts_text_token_len,
-                       'prompt_text': prompt_text_token, 'prompt_text_len': prompt_text_token_len,
-                       'llm_prompt_speech_token': speech_token, 'llm_prompt_speech_token_len': speech_token_len,
-                       'flow_prompt_speech_token': flow_speech_token, 'flow_prompt_speech_token_len': flow_speech_token_len,
-                       'prompt_speech_feat': speech_feat, 'prompt_speech_feat_len': speech_feat_len,
-                       'llm_embedding': embedding, 'flow_embedding': flow_embedding}
+        model_input = {
+            "text": tts_text_token,
+            "text_len": tts_text_token_len,
+            "prompt_text": prompt_text_token,
+            "prompt_text_len": prompt_text_token_len,
+            "llm_prompt_speech_token": speech_token,
+            "llm_prompt_speech_token_len": speech_token_len,
+            "flow_prompt_speech_token": flow_speech_token,
+            "flow_prompt_speech_token_len": flow_speech_token_len,
+            "prompt_speech_feat": speech_feat,
+            "prompt_speech_feat_len": speech_feat_len,
+            "llm_embedding": embedding,
+            "flow_embedding": flow_embedding,
+        }
         return model_input
+
 
 ####model
 class CustomCosyVoiceModel(CosyVoiceModel):
 
-    def __init__(self,
-                 llm: torch.nn.Module,
-                 flow: torch.nn.Module,
-                 hift: torch.nn.Module):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    def __init__(
+        self, llm: torch.nn.Module, flow: torch.nn.Module, hift: torch.nn.Module
+    ):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.llm = llm
         self.flow = flow
         self.hift = hift
@@ -166,63 +233,84 @@ class CustomCosyVoiceModel(CosyVoiceModel):
         self.hift.load_state_dict(torch.load(hift_model, map_location=self.device))
         self.hift.to(self.device).eval()
 
-    def inference(self, text, text_len, flow_embedding, llm_embedding=torch.zeros(0, 192),
-                  prompt_text=torch.zeros(1, 0, dtype=torch.int32), prompt_text_len=torch.zeros(1, dtype=torch.int32),
-                  llm_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32), llm_prompt_speech_token_len=torch.zeros(1, dtype=torch.int32),
-                  flow_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32), flow_prompt_speech_token_len=torch.zeros(1, dtype=torch.int32),
-                  prompt_speech_feat=torch.zeros(1, 0, 80), prompt_speech_feat_len=torch.zeros(1, dtype=torch.int32)):
-        tts_speech_token = self.llm.inference(text=text.to(self.device),
-                                              text_len=text_len.to(self.device),
-                                              prompt_text=prompt_text.to(self.device),
-                                              prompt_text_len=prompt_text_len.to(self.device),
-                                              prompt_speech_token=llm_prompt_speech_token.to(self.device),
-                                              prompt_speech_token_len=llm_prompt_speech_token_len.to(self.device),
-                                              embedding=llm_embedding.to(self.device),
-                                              beam_size=1,
-                                              sampling=25,
-                                              max_token_text_ratio=30,
-                                              min_token_text_ratio=3)
-        
-        #input()
+    def inference(
+        self,
+        text,
+        text_len,
+        flow_embedding,
+        llm_embedding=torch.zeros(0, 192),
+        prompt_text=torch.zeros(1, 0, dtype=torch.int32),
+        prompt_text_len=torch.zeros(1, dtype=torch.int32),
+        llm_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32),
+        llm_prompt_speech_token_len=torch.zeros(1, dtype=torch.int32),
+        flow_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32),
+        flow_prompt_speech_token_len=torch.zeros(1, dtype=torch.int32),
+        prompt_speech_feat=torch.zeros(1, 0, 80),
+        prompt_speech_feat_len=torch.zeros(1, dtype=torch.int32),
+    ):
+        tts_speech_token = self.llm.inference(
+            text=text.to(self.device),
+            text_len=text_len.to(self.device),
+            prompt_text=prompt_text.to(self.device),
+            prompt_text_len=prompt_text_len.to(self.device),
+            prompt_speech_token=llm_prompt_speech_token.to(self.device),
+            prompt_speech_token_len=llm_prompt_speech_token_len.to(self.device),
+            embedding=llm_embedding.to(self.device),
+            beam_size=1,
+            sampling=25,
+            max_token_text_ratio=30,
+            min_token_text_ratio=3,
+        )
 
-        tts_mel = self.flow.inference(token=tts_speech_token,
-                                      token_len=torch.tensor([tts_speech_token.size(1)], dtype=torch.int32).to(self.device),
-                                      prompt_token=flow_prompt_speech_token.to(self.device),
-                                      prompt_token_len=flow_prompt_speech_token_len.to(self.device),
-                                      prompt_feat=prompt_speech_feat.to(self.device),
-                                      prompt_feat_len=prompt_speech_feat_len.to(self.device),
-                                      embedding=flow_embedding.to(self.device))
+        # input()
+
+        tts_mel = self.flow.inference(
+            token=tts_speech_token,
+            token_len=torch.tensor([tts_speech_token.size(1)], dtype=torch.int32).to(
+                self.device
+            ),
+            prompt_token=flow_prompt_speech_token.to(self.device),
+            prompt_token_len=flow_prompt_speech_token_len.to(self.device),
+            prompt_feat=prompt_speech_feat.to(self.device),
+            prompt_feat_len=prompt_speech_feat_len.to(self.device),
+            embedding=flow_embedding.to(self.device),
+        )
         tts_speech = self.hift.inference(mel=tts_mel).cpu()
         torch.cuda.empty_cache()
-        return {'tts_speech': tts_speech}
-     
+        return {"tts_speech": tts_speech}
+
+
 ###CosyVoice
 class CustomCosyVoice:
 
     def __init__(self, model_dir, ttsfrd_resource_dir: str = ""):
-        #assert os.path.exists(model_dir), f"model path '{model_dir}' not exist, please check the path: pretrained_models/CosyVoice-300M-zhtw"
+        # assert os.path.exists(model_dir), f"model path '{model_dir}' not exist, please check the path: pretrained_models/CosyVoice-300M-zhtw"
         instruct = False
-        
+
         if not os.path.exists(model_dir):
             model_dir = snapshot_download(model_dir)
         print("model", model_dir)
         self.model_dir = model_dir
-        
-        with open('{}/cosyvoice.yaml'.format(model_dir), 'r') as f:
+
+        with open("{}/cosyvoice.yaml".format(model_dir), "r") as f:
             configs = load_hyperpyyaml(f)
-        self.frontend = CustomCosyVoiceFrontEnd(configs['get_tokenizer'],
-                                          configs['feat_extractor'],
-                                          model_dir,
-                                          '{}/campplus.onnx'.format(model_dir),
-                                          '{}/speech_tokenizer_v1.onnx'.format(model_dir),
-                                          ttsfrd_resource_dir,
-                                          '{}/spk2info.pt'.format(model_dir),
-                                          instruct,
-                                          configs['allowed_special'])
-        self.model = CosyVoiceModel(configs['llm'], configs['flow'], configs['hift'])
-        self.model.load('{}/llm.pt'.format(model_dir),
-                        '{}/flow.pt'.format(model_dir),
-                        '{}/hift.pt'.format(model_dir))
+        self.frontend = CustomCosyVoiceFrontEnd(
+            configs["get_tokenizer"],
+            configs["feat_extractor"],
+            model_dir,
+            "{}/campplus.onnx".format(model_dir),
+            "{}/speech_tokenizer_v1.onnx".format(model_dir),
+            ttsfrd_resource_dir,
+            "{}/spk2info.pt".format(model_dir),
+            instruct,
+            configs["allowed_special"],
+        )
+        self.model = CosyVoiceModel(configs["llm"], configs["flow"], configs["hift"])
+        self.model.load(
+            "{}/llm.pt".format(model_dir),
+            "{}/flow.pt".format(model_dir),
+            "{}/hift.pt".format(model_dir),
+        )
         del configs
 
     def list_avaliable_spks(self):
@@ -234,52 +322,62 @@ class CustomCosyVoice:
         for i in self.frontend.text_normalize(tts_text, split=True):
             model_input = self.frontend.frontend_sft(i, spk_id)
             model_output = self.model.inference(**model_input)
-            tts_speeches.append(model_output['tts_speech'])
-        return {'tts_speech': torch.concat(tts_speeches, dim=1)}
+            tts_speeches.append(model_output["tts_speech"])
+        return {"tts_speech": torch.concat(tts_speeches, dim=1)}
 
     def inference_zero_shot(self, tts_text, prompt_text, prompt_speech_16k):
         prompt_text = self.frontend.text_normalize(prompt_text, split=False)
         tts_speeches = []
         for i in self.frontend.text_normalize(tts_text, split=True):
-            model_input = self.frontend.frontend_zero_shot(i, prompt_text, prompt_speech_16k)
+            model_input = self.frontend.frontend_zero_shot(
+                i, prompt_text, prompt_speech_16k
+            )
             model_output = self.model.inference(**model_input)
-            tts_speeches.append(model_output['tts_speech'])
-        return {'tts_speech': torch.concat(tts_speeches, dim=1)}
-    
-    def inference_zero_shot_no_unit_condition_no_normalize(self, tts_text, prompt_text, prompt_speech_16k, flow_prompt_text = None, flow_prompt_speech_16k = None):
+            tts_speeches.append(model_output["tts_speech"])
+        return {"tts_speech": torch.concat(tts_speeches, dim=1)}
+
+    def inference_zero_shot_no_unit_condition_no_normalize(
+        self,
+        tts_text,
+        prompt_text,
+        prompt_speech_16k,
+        flow_prompt_text=None,
+        flow_prompt_speech_16k=None,
+    ):
         if flow_prompt_text == None:
             flow_prompt_text = prompt_text
         if flow_prompt_speech_16k == None:
             flow_prompt_speech_16k = prompt_speech_16k
         prompt_text = prompt_text
-        tts_speeches = []
-        for i in re.split(r'(?<=[？！。.?!])\s*', tts_text):
-            if not len(i):
-                continue
-            model_input = self.frontend.frontend_zero_shot_dual(i, prompt_text, prompt_speech_16k, flow_prompt_text, flow_prompt_speech_16k)
-            print(model_input.keys())
-            model_input["llm_prompt_speech_token"] = model_input["llm_prompt_speech_token"][:,:0]
-            model_input["llm_prompt_speech_token_len"][0] = 0
-            model_output = self.model.inference(**model_input)
-            tts_speeches.append(model_output['tts_speech'])
-        return {'tts_speech': torch.concat(tts_speeches, dim=1)}
-        
-    def inference_zero_shot_no_normalize(self, tts_text, prompt_text, prompt_speech_16k):
+        model_input = self.frontend.frontend_zero_shot_dual(
+            tts_text,
+            prompt_text,
+            prompt_speech_16k,
+            flow_prompt_text,
+            flow_prompt_speech_16k,
+        )
+        model_input["llm_prompt_speech_token"] = model_input["llm_prompt_speech_token"][
+            :, :0
+        ]
+        model_input["llm_prompt_speech_token_len"][0] = 0
+        model_output = self.model.inference(**model_input)
+        return {"tts_speech": model_output["tts_speech"]}
+
+    def inference_zero_shot_no_normalize(
+        self, tts_text, prompt_text, prompt_speech_16k
+    ):
         prompt_text = prompt_text
-        tts_speeches = []
-        for i in re.split(r'(?<=[？！。.?!])\s*', tts_text):
-            if not len(i):
-                continue
-            print("Synthesizing:",i)
-            model_input = self.frontend.frontend_zero_shot(i, prompt_text, prompt_speech_16k)
-            model_output = self.model.inference(**model_input)
-            tts_speeches.append(model_output['tts_speech'])
-        return {'tts_speech': torch.concat(tts_speeches, dim=1)}
-        
+        model_input = self.frontend.frontend_zero_shot(
+            tts_text, prompt_text, prompt_speech_16k
+        )
+        model_output = self.model.inference(**model_input)
+        return {"tts_speech": model_output["tts_speech"]}
+
+
 ####wav2text
 def transcribe_audio(audio_file):
-    #model = whisper.load_model("base")
-    #result = model.transcribe(audio_file)
+    # model = whisper.load_model("base")
+    # result = model.transcribe(audio_file)
     from transformers import pipeline
 
     # Load Whisper model
@@ -288,48 +386,342 @@ def transcribe_audio(audio_file):
     # Perform ASR on an audio file
     result = whisper_asr(audio_file)
 
-    converter = opencc.OpenCC('s2t')
+    converter = opencc.OpenCC("s2t")
     traditional_text = converter.convert(result["text"])
     return traditional_text
+
+
+CONNECTED_CJK_RARE_AUGMENT_THRESHOLD = 500
+CONNECTED_CJK_POLYPHONE_AUGMENT_THRESHOLD = 2000
+_CONNECTED_CJK_SINGLE_PRONUNCIATION_AUGMENT_THRESHOLD = 20
+
+_CONNECTED_CJK_SHORT_PHRASE_LEN = 12
+_QUESTION_CONNECTED_CJK_SHORT_PHRASE_LEN = 20
+_QUESTION_TAIL_FALLBACK_MAX_CANDIDATES = 2
+_SINGLE_PRONUNCIATION_FALLBACK_THRESHOLD = 100
+
+
+def _is_cjk_char(char):
+    return isinstance(char, str) and len(char) == 1 and "\u3400" <= char <= "\u9fff"
+
+
+def _get_connected_cjk_span_length(text_w_bopomofo, index):
+    start = index
+    while start > 0 and _is_cjk_char(text_w_bopomofo[start - 1][0]):
+        start -= 1
+
+    end = index
+    while end + 1 < len(text_w_bopomofo) and _is_cjk_char(text_w_bopomofo[end + 1][0]):
+        end += 1
+
+    return end - start + 1
+
+
+def _is_question_tail_char(text_w_bopomofo, index, max_cjk_chars=2):
+    cjk_count = 0
+    for lookahead_index in range(index, len(text_w_bopomofo)):
+        lookahead_char = text_w_bopomofo[lookahead_index][0]
+        if lookahead_char in "？?":
+            return 0 < cjk_count <= max_cjk_chars
+        if _is_cjk_char(lookahead_char):
+            cjk_count += 1
+            continue
+        if lookahead_char in "，、,:：":
+            return False
+    return False
+
+
+def _is_question_connected_phrase(text_w_bopomofo, index):
+    if index < 0 or index >= len(text_w_bopomofo):
+        return False
+    if not _is_cjk_char(text_w_bopomofo[index][0]):
+        return False
+
+    start = index
+    while start > 0 and _is_cjk_char(text_w_bopomofo[start - 1][0]):
+        start -= 1
+
+    end = index
+    while end + 1 < len(text_w_bopomofo) and _is_cjk_char(text_w_bopomofo[end + 1][0]):
+        end += 1
+
+    if (end - start + 1) > _QUESTION_CONNECTED_CJK_SHORT_PHRASE_LEN:
+        return False
+
+    lookahead_index = end + 1
+    while lookahead_index < len(text_w_bopomofo):
+        lookahead_char = text_w_bopomofo[lookahead_index][0]
+        if lookahead_char in "？?":
+            return True
+        if lookahead_char in " \t\r\n'\"）)]】〉》」』":
+            lookahead_index += 1
+            continue
+        return False
+    return False
+
 
 def get_bopomofo_rare(text, converter):
     res = converter(text)
     text_w_bopomofo = [x for x in zip(list(text), res[0])]
     reconstructed_text = ""
-    
+
     for i in range(len(text_w_bopomofo)):
         t = text_w_bopomofo[i]
+        char = t[0]
+        pronunciation = t[1]
+        char_frequency = word_to_dataset_frequency.get(char, 0)
+        candidate_pronunciations = char2phn.get(char, [])
         try:
-            next_t_char = text_w_bopomofo[i+1][0]
+            prev_t_char = text_w_bopomofo[i - 1][0] if i > 0 else None
+        except:
+            prev_t_char = None
+        try:
+            next_t_char = text_w_bopomofo[i + 1][0]
         except:
             next_t_char = None
-        #print(t[0], word_to_dataset_frequency[t[0]], t[1])
-        
-        if word_to_dataset_frequency[t[0]] < 500 and t[1] != None and next_t_char != '[':
+        prev_is_cjk = _is_cjk_char(prev_t_char)
+        next_is_cjk = _is_cjk_char(next_t_char)
+        in_connected_cjk_phrase = prev_is_cjk or next_is_cjk
+        in_embedded_cjk_phrase = prev_is_cjk and next_is_cjk
+        is_question_tail_char = _is_question_tail_char(text_w_bopomofo, i)
+        in_question_connected_phrase = _is_question_connected_phrase(text_w_bopomofo, i)
+        if pronunciation is None and candidate_pronunciations:
+            should_use_single_pronunciation_fallback = (
+                len(candidate_pronunciations) == 1
+                and char_frequency < _SINGLE_PRONUNCIATION_FALLBACK_THRESHOLD
+            )
+            should_use_question_tail_fallback = (
+                is_question_tail_char
+                and len(candidate_pronunciations)
+                <= _QUESTION_TAIL_FALLBACK_MAX_CANDIDATES
+            )
+            if (
+                should_use_single_pronunciation_fallback
+                or should_use_question_tail_fallback
+            ):
+                pronunciation = candidate_pronunciations[0]
+        connected_cjk_span_length = _get_connected_cjk_span_length(text_w_bopomofo, i)
+        connected_phrase_protect_limit = (
+            _QUESTION_CONNECTED_CJK_SHORT_PHRASE_LEN
+            if in_question_connected_phrase
+            else _CONNECTED_CJK_SHORT_PHRASE_LEN
+        )
+        preserve_short_connected_phrase = (
+            in_connected_cjk_phrase
+            and connected_cjk_span_length <= connected_phrase_protect_limit
+        )
+        suppress_question_phrase_markup = (
+            in_question_connected_phrase and char not in always_augment_chars
+        )
+        # print(t[0], word_to_dataset_frequency[t[0]], t[1])
+
+        should_force_rare_connected_markup = (
+            in_connected_cjk_phrase
+            and not preserve_short_connected_phrase
+            and pronunciation is not None
+            and not suppress_question_phrase_markup
+            and char_frequency < CONNECTED_CJK_RARE_AUGMENT_THRESHOLD
+            and (
+                char in always_augment_chars
+                or len(candidate_pronunciations) >= 2
+                or char_frequency
+                < _CONNECTED_CJK_SINGLE_PRONUNCIATION_AUGMENT_THRESHOLD
+            )
+        )
+        should_force_single_pronunciation_markup = (
+            len(candidate_pronunciations) == 1
+            and char_frequency < _SINGLE_PRONUNCIATION_FALLBACK_THRESHOLD
+            and pronunciation is not None
+            and next_t_char != "["
+            and not suppress_question_phrase_markup
+            and (
+                not in_connected_cjk_phrase
+                or char in always_augment_chars
+                or is_question_tail_char
+                or char_frequency
+                < _CONNECTED_CJK_SINGLE_PRONUNCIATION_AUGMENT_THRESHOLD
+            )
+        )
+        should_force_question_tail_markup = (
+            is_question_tail_char
+            and pronunciation is not None
+            and next_t_char != "["
+            and not suppress_question_phrase_markup
+            and len(candidate_pronunciations) <= _QUESTION_TAIL_FALLBACK_MAX_CANDIDATES
+        )
+
+        if (
+            should_force_single_pronunciation_markup
+            or should_force_question_tail_markup
+        ):
+            reconstructed_text += char + f"[:{pronunciation}]"
+
+        elif (
+            char_frequency < CONNECTED_CJK_RARE_AUGMENT_THRESHOLD
+            and pronunciation is not None
+            and next_t_char != "["
+            and not preserve_short_connected_phrase
+            and not suppress_question_phrase_markup
+            and (not in_connected_cjk_phrase or should_force_rare_connected_markup)
+        ):
             # Add the char and the pronunciation
-            reconstructed_text += t[0] + f"[:{t[1]}]"
-        
-        elif len(char2phn[t[0]]) >= 2:
-            if t[1] != char2phn[t[0]][0] and (word_to_dataset_frequency[t[0]] < 10000 or t[0] in always_augment_chars) and next_t_char != '[':  # Not most common pronunciation
+            reconstructed_text += char + f"[:{pronunciation}]"
+
+        elif len(candidate_pronunciations) >= 2:
+            should_augment_polyphone = (
+                pronunciation != candidate_pronunciations[0]
+                and (char_frequency < 10000 or char in always_augment_chars)
+                and next_t_char != "["
+            )
+            should_force_connected_polyphone_markup = (
+                in_connected_cjk_phrase
+                and not preserve_short_connected_phrase
+                and pronunciation is not None
+                and char_frequency < CONNECTED_CJK_POLYPHONE_AUGMENT_THRESHOLD
+            )
+            # Keep phrase-level prosody by avoiding most inline bopomofo markup
+            # inside connected Chinese text, but still allow it for explicitly
+            # important or unusually rare characters we want to guide.
+            if (
+                should_augment_polyphone
+                and (
+                    char in always_augment_chars
+                    or should_force_connected_polyphone_markup
+                    or not in_embedded_cjk_phrase
+                    and not in_connected_cjk_phrase
+                )
+                and not suppress_question_phrase_markup
+            ):
                 # Add the char and the pronunciation
-                reconstructed_text += t[0] + f"[:{t[1]}]"
+                reconstructed_text += char + f"[:{pronunciation}]"
             else:
-                reconstructed_text += t[0]
-            #print("DEBUG, multiphone char", t[0], char2phn[t[0]])
+                reconstructed_text += char
+            # print("DEBUG, multiphone char", t[0], char2phn[t[0]])
         else:
             # Add only the char
-            reconstructed_text += t[0]
-    
-    #print("Reconstructed:", reconstructed_text)
+            reconstructed_text += char
+
+    # print("Reconstructed:", reconstructed_text)
     return reconstructed_text
 
-import re
+
+def _should_augment_chunk_head_char(char, pronunciation, next_char):
+    if not _is_cjk_char(char) or pronunciation is None or next_char == "[":
+        return False
+
+    char_frequency = word_to_dataset_frequency.get(char, 0)
+    candidate_pronunciations = char2phn.get(char, [])
+    if char in always_augment_chars:
+        return True
+    if len(candidate_pronunciations) == 1:
+        return char_frequency < _SINGLE_PRONUNCIATION_FALLBACK_THRESHOLD
+    if len(candidate_pronunciations) >= 2:
+        return (
+            pronunciation != candidate_pronunciations[0]
+            and char_frequency < CONNECTED_CJK_POLYPHONE_AUGMENT_THRESHOLD
+        )
+    return char_frequency < CONNECTED_CJK_RARE_AUGMENT_THRESHOLD
+
+
+def _augment_chunk_head_pronunciation(
+    text,
+    converter,
+    max_cjk_chars=4,
+    max_markup_chars=1,
+):
+    if not text:
+        return text
+
+    res = converter(text)
+    pronunciations = res[0]
+    head_cjk_count = 0
+    head_markup_count = 0
+    reconstructed = []
+
+    for index, char in enumerate(text):
+        pronunciation = pronunciations[index]
+        next_char = text[index + 1] if index + 1 < len(text) else None
+
+        if _is_cjk_char(char):
+            if (
+                head_cjk_count < max_cjk_chars
+                and head_markup_count < max_markup_chars
+                and _should_augment_chunk_head_char(char, pronunciation, next_char)
+            ):
+                reconstructed.append(char + f"[:{pronunciation}]")
+                head_markup_count += 1
+            else:
+                reconstructed.append(char)
+            head_cjk_count += 1
+            continue
+
+        reconstructed.append(char)
+        if head_cjk_count > 0:
+            break
+
+    if len(reconstructed) < len(text):
+        reconstructed.append(text[len(reconstructed) :])
+    return "".join(reconstructed)
+
+
+def _has_inline_bopomofo_markup(text):
+    return bool(_BOPOMOFO_MARK_RE.search(str(text or "")))
+
+
+def _contains_bopomofo_text(text):
+    return any(
+        "\u3105" <= char <= "\u3129" or char in "˙ˊˇˋ˪˫" for char in str(text or "")
+    )
+
+
+def _build_text_with_external_bopomofo(text, bopomofo):
+    normalized_text = _normalize_chunk_text(text)
+    normalized_bopomofo = _MULTISPACE_RE.sub(" ", str(bopomofo or "")).strip()
+    if not normalized_text or not normalized_bopomofo:
+        return normalized_text
+    if _has_inline_bopomofo_markup(normalized_bopomofo):
+        return normalized_bopomofo
+
+    bopomofo_tokens = [token for token in normalized_bopomofo.split(" ") if token]
+    if not bopomofo_tokens:
+        return normalized_text
+
+    reconstructed = []
+    bopomofo_index = 0
+    attached_count = 0
+    for char in normalized_text:
+        if _is_cjk_char(char):
+            while bopomofo_index < len(bopomofo_tokens) and not _contains_bopomofo_text(
+                bopomofo_tokens[bopomofo_index]
+            ):
+                bopomofo_index += 1
+            if bopomofo_index < len(bopomofo_tokens):
+                reconstructed.append(char + f"[:{bopomofo_tokens[bopomofo_index]}]")
+                bopomofo_index += 1
+                attached_count += 1
+            else:
+                reconstructed.append(char)
+            continue
+
+        if (
+            bopomofo_index < len(bopomofo_tokens)
+            and bopomofo_tokens[bopomofo_index] == char
+        ):
+            bopomofo_index += 1
+        reconstructed.append(char)
+
+    if attached_count == 0:
+        return normalized_text
+    return "".join(reconstructed)
+
 
 def parse_transcript(text, end):
     pattern = r"<\|(\d+\.\d+)\|>([^<]+)<\|(\d+\.\d+)\|>"
     matches = re.findall(pattern, text)
-    
-    parsed_output = [(float(start), float(end), content.strip()) for start, content,end in matches]
+
+    parsed_output = [
+        (float(start), float(end), content.strip()) for start, content, end in matches
+    ]
     count0 = 0
     for i in range(len(parsed_output)):
         if parsed_output[i][0] == 0:
@@ -337,19 +729,19 @@ def parse_transcript(text, end):
         if count0 >= 2:
             parsed_output = parsed_output[:i]
             break
-    #print("a", parsed_output)
+    # print("a", parsed_output)
     for i in range(len(parsed_output)):
         if parsed_output[i][0] >= end:
             parsed_output = parsed_output[:i]
             break
-    #print("b", parsed_output)
+    # print("b", parsed_output)
     for i in range(len(parsed_output)):
         if parsed_output[i][0] < end - 15:
             continue
         else:
             parsed_output = parsed_output[i:]
             break
-    #print("c", parsed_output)
+    # print("c", parsed_output)
     start = parsed_output[0][0]
     parsed_output = "".join([p[2] for p in parsed_output])
     return parsed_output, start
@@ -358,18 +750,150 @@ def parse_transcript(text, end):
 _STRONG_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？?!；;])\s*")
 _WEAK_SENTENCE_SPLIT_RE = re.compile(r"(?<=[，、,：:])\s*")
 _MULTISPACE_RE = re.compile(r"\s+")
+_ASCII_WORD_RE = re.compile(r"[A-Za-z]+")
+_DIGIT_RE = re.compile(r"\d")
+_BOPOMOFO_MARK_RE = re.compile(r"\[:[^\]]+\]")
+_CLOSING_QUOTE_BOUNDARY_RE = re.compile(r'(?<=[”」』"])\s*(?=[\u3400-\u9fffA-Za-z0-9])')
+_CLOSING_QUOTE_RE = re.compile(r'[”」』"]$')
+_LEADING_CONNECTIVE_RE = re.compile(
+    r"^(比喻|例如|比如|所以|因此|也就是|換句話說|意思是)"
+)
+_CJK_PUNCT_TRANSLATION = str.maketrans(
+    {
+        ",": "，",
+        ";": "；",
+        ":": "：",
+        "?": "？",
+        "!": "！",
+    }
+)
+_MAX_TTS_TEXT_TOKEN_LEN = 600
+_MAX_PROMPT_TEXT_TOKEN_LEN = 400
+_MAX_AUGMENTED_TOKEN_RATIO = 3.0
+_SHORT_CHINESE_SENTENCE_CHARS = 80
+_DEFAULT_TTS_CHUNK_MAX_CHARS = 120
+_UNPUNCTUATED_TTS_CHUNK_MAX_CHARS = 180
+_CONSERVATIVE_TTS_CHUNK_MAX_CHARS = 60
+_CONSERVATIVE_TTS_CHUNK_MIN_CHARS = 14
 
 
 def _normalize_chunk_text(text):
     if not isinstance(text, str):
         return ""
     normalized = _MULTISPACE_RE.sub(" ", text).strip()
+    if contains_chinese(normalized):
+        normalized = normalized.translate(_CJK_PUNCT_TRANSLATION)
     normalized = normalized.replace(" ,", "，").replace(" .", "。")
     normalized = normalized.replace(" ?", "？").replace(" !", "！")
     return normalized
 
 
-def _split_long_chunk(text, max_chars=80):
+def _has_pause_punctuation(text):
+    normalized = _normalize_chunk_text(text)
+    if not normalized:
+        return False
+    return any(char in normalized for char in "。！？?!；;，、,:：")
+
+
+def _get_text_token_length(frontend, text):
+    if not text:
+        return 0
+    return len(
+        frontend.tokenizer.encode(text, allowed_special=frontend.allowed_special)
+    )
+
+
+def _select_safe_text_variant(
+    frontend,
+    preferred_text,
+    fallback_text,
+    *,
+    max_token_len,
+    label,
+):
+    preferred_len = _get_text_token_length(frontend, preferred_text)
+    fallback_len = _get_text_token_length(frontend, fallback_text)
+    safe_ratio_limit = max(32, int(max(fallback_len, 1) * _MAX_AUGMENTED_TOKEN_RATIO))
+
+    if preferred_len <= max_token_len and preferred_len <= safe_ratio_limit:
+        return preferred_text
+
+    print(
+        f"fallback to plain {label}: token_len={preferred_len}, "
+        f"plain_token_len={fallback_len}"
+    )
+    return fallback_text
+
+
+def _is_attention_length_mismatch(exc):
+    message = str(exc)
+    return (
+        "must match the size of tensor" in message
+        and "non-singleton dimension 3" in message
+    )
+
+
+def _estimate_tts_cost(text):
+    text = _normalize_chunk_text(text)
+    if not text:
+        return 0.0
+
+    cost = 0.0
+    index = 0
+    while index < len(text):
+        bopomofo_match = _BOPOMOFO_MARK_RE.match(text, index)
+        if bopomofo_match:
+            cost += 0.8
+            index = bopomofo_match.end()
+            continue
+
+        char = text[index]
+        if "\u3400" <= char <= "\u9fff":
+            cost += 1.0
+        elif char in "。！？?!；;":
+            cost += 0.2
+        elif char in "，、,:：":
+            cost += 0.12
+        elif char.isdigit():
+            cost += 1.3
+        elif char.isalpha():
+            cost += 0.45
+        else:
+            cost += 0.15
+        index += 1
+
+    ascii_words = len(_ASCII_WORD_RE.findall(text))
+    digits = len(_DIGIT_RE.findall(text))
+    cost += ascii_words * 0.7 + digits * 0.15
+    return cost
+
+
+def _should_keep_strong_chunk(text, max_chars=120):
+    text = _normalize_chunk_text(text)
+    if not text:
+        return False
+
+    text_len = len(text)
+    if text_len <= max_chars:
+        return True
+
+    strong_punct_count = sum(text.count(char) for char in "。！？?!；;")
+    weak_punct_count = sum(text.count(char) for char in "，、,:：")
+    ascii_words = len(_ASCII_WORD_RE.findall(text))
+    digits = len(_DIGIT_RE.findall(text))
+    estimated_cost = _estimate_tts_cost(text)
+
+    return (
+        strong_punct_count <= 1
+        and weak_punct_count <= 3
+        and ascii_words <= 4
+        and digits <= 10
+        and text_len <= max_chars + 24
+        and estimated_cost <= 180
+    )
+
+
+def _split_long_chunk(text, max_chars=120):
     text = _normalize_chunk_text(text)
     if len(text) <= max_chars:
         return [text] if text else []
@@ -378,8 +902,8 @@ def _split_long_chunk(text, max_chars=80):
     remainder = text
     while len(remainder) > max_chars:
         split_at = -1
-        window = remainder[:max_chars + 1]
-        for delimiter in ["，", "、", "：", "；", ",", ":", ";", " "]:
+        window = remainder[: max_chars + 1]
+        for delimiter in ["；", "：", "，", "、", ";", ":", ",", " "]:
             candidate = window.rfind(delimiter)
             if candidate > split_at:
                 split_at = candidate
@@ -399,12 +923,265 @@ def _split_long_chunk(text, max_chars=80):
     return pieces
 
 
-def _split_tts_content(text, max_chars=80):
+def _is_punctuation_only_chunk(text):
+    normalized = _normalize_chunk_text(text)
+    if not normalized:
+        return False
+    return not any(_is_cjk_char(char) or char.isalnum() for char in normalized)
+
+
+def _merge_tiny_chunks(chunks, max_chars=60, min_chars=14):
+    normalized_chunks = []
+    for chunk in chunks:
+        chunk = _normalize_chunk_text(chunk)
+        if not chunk:
+            continue
+        normalized_chunks.append(chunk)
+
+    merged_chunks = []
+    index = 0
+    while index < len(normalized_chunks):
+        chunk = normalized_chunks[index]
+        if _is_punctuation_only_chunk(chunk):
+            if merged_chunks and len(merged_chunks[-1] + chunk) <= max_chars + 2:
+                merged_chunks[-1] += chunk
+                index += 1
+                continue
+            if index + 1 < len(normalized_chunks):
+                normalized_chunks[index + 1] = chunk + normalized_chunks[index + 1]
+                index += 1
+                continue
+        if len(chunk) >= min_chars:
+            merged_chunks.append(chunk)
+            index += 1
+            continue
+
+        if merged_chunks and len(merged_chunks[-1] + chunk) <= max_chars:
+            merged_chunks[-1] += chunk
+            index += 1
+            continue
+
+        if index + 1 < len(normalized_chunks):
+            next_chunk = normalized_chunks[index + 1]
+            if len(chunk + next_chunk) <= max_chars:
+                merged_chunks.append(chunk + next_chunk)
+                index += 2
+                continue
+
+        merged_chunks.append(chunk)
+        index += 1
+
+    return merged_chunks
+
+
+def _ensure_sentence_tail(text):
+    text = _normalize_chunk_text(text)
+    if not text:
+        return text
+    if text[-1] in "。！？?!；;":
+        return text
+    if text[-1] in "，、,:：":
+        return text
+    if contains_chinese(text):
+        return text + "。"
+    return text + "."
+
+
+def _merge_split_chunks(chunks, max_chars=120):
+    merged_chunks = []
+    for chunk in chunks:
+        chunk = _normalize_chunk_text(chunk)
+        if not chunk:
+            continue
+        candidate = merged_chunks[-1] + chunk if merged_chunks else chunk
+        if (
+            merged_chunks
+            and len(chunk) < 28
+            and len(candidate) <= max_chars
+            and _estimate_tts_cost(candidate) <= 160
+        ):
+            merged_chunks[-1] += chunk
+        else:
+            merged_chunks.append(chunk)
+
+    connective_merged_chunks = []
+    for chunk in merged_chunks:
+        chunk = _normalize_chunk_text(chunk)
+        if not chunk:
+            continue
+
+        if connective_merged_chunks:
+            candidate = connective_merged_chunks[-1] + chunk
+            if (
+                _LEADING_CONNECTIVE_RE.match(chunk)
+                and len(candidate) <= max_chars + 20
+                and _estimate_tts_cost(candidate) <= 165
+            ):
+                connective_merged_chunks[-1] += chunk
+                continue
+
+        connective_merged_chunks.append(chunk)
+
+    return connective_merged_chunks
+
+
+def _merge_connective_sentences(chunks, max_chars=120):
+    merged_chunks = []
+    for chunk in chunks:
+        chunk = _normalize_chunk_text(chunk)
+        if not chunk:
+            continue
+
+        if merged_chunks:
+            previous_chunk = merged_chunks[-1]
+            candidate = previous_chunk + chunk
+            if (
+                previous_chunk[-1] in "。！？?!；;"
+                and _LEADING_CONNECTIVE_RE.match(chunk)
+                and len(candidate) <= max_chars
+                and _estimate_tts_cost(candidate) <= 170
+            ):
+                merged_chunks[-1] = candidate
+                continue
+
+        merged_chunks.append(chunk)
+
+    return merged_chunks
+
+
+def _split_tts_content_with_frontend(
+    text,
+    frontend,
+    token_max_n=80,
+    token_min_n=60,
+    merge_len=20,
+):
     normalized = _normalize_chunk_text(text)
     if not normalized:
         return []
 
-    rough_chunks = [chunk for chunk in _STRONG_SENTENCE_SPLIT_RE.split(normalized) if chunk]
+    raw_chunks = split_paragraph(
+        normalized,
+        partial(frontend.tokenizer.encode, allowed_special=frontend.allowed_special),
+        "zh",
+        token_max_n=token_max_n,
+        token_min_n=token_min_n,
+        merge_len=merge_len,
+        comma_split=False,
+    )
+
+    chunks = []
+    for raw_chunk in raw_chunks:
+        chunk = _normalize_chunk_text(raw_chunk)
+        if chunk:
+            chunks.append(chunk)
+
+    if not chunks:
+        return []
+
+    return [_ensure_sentence_tail(chunk) for chunk in chunks]
+
+
+def _split_chunk_conservatively(text, max_chars=60, min_chars=14):
+    normalized = _normalize_chunk_text(text)
+    if not normalized:
+        return []
+    if len(normalized) <= max_chars:
+        return [normalized]
+
+    chunks = [normalized]
+    split_patterns = (
+        _STRONG_SENTENCE_SPLIT_RE,
+        _WEAK_SENTENCE_SPLIT_RE,
+    )
+    for split_pattern in split_patterns:
+        next_chunks = []
+        for chunk in chunks:
+            if len(chunk) <= max_chars:
+                next_chunks.append(chunk)
+                continue
+            split_parts = [
+                _normalize_chunk_text(part)
+                for part in split_pattern.split(chunk)
+                if _normalize_chunk_text(part)
+            ]
+            if len(split_parts) <= 1:
+                next_chunks.append(chunk)
+                continue
+            next_chunks.extend(split_parts)
+        chunks = next_chunks
+
+    final_chunks = []
+    for chunk in chunks:
+        if len(chunk) <= max_chars:
+            final_chunks.append(chunk)
+            continue
+        final_chunks.extend(_split_long_chunk(chunk, max_chars=max_chars))
+
+    return _merge_tiny_chunks(
+        final_chunks,
+        max_chars=max_chars,
+        min_chars=min_chars,
+    )
+
+
+def _stabilize_frontend_content_chunks(chunks, max_chars=60, min_chars=14):
+    stabilized_chunks = []
+    for chunk in chunks:
+        chunk = _normalize_chunk_text(chunk)
+        if not chunk:
+            continue
+        if contains_chinese(chunk) and len(chunk) > max_chars:
+            stabilized_chunks.extend(
+                _split_chunk_conservatively(
+                    chunk,
+                    max_chars=max_chars,
+                    min_chars=min_chars,
+                )
+            )
+            continue
+        stabilized_chunks.append(chunk)
+    return stabilized_chunks
+
+
+def _split_quote_tail_chunks(text):
+    text = _normalize_chunk_text(text)
+    if not text:
+        return []
+
+    raw_chunks = [chunk for chunk in _CLOSING_QUOTE_BOUNDARY_RE.split(text) if chunk]
+    if len(raw_chunks) <= 1:
+        return [text]
+
+    chunks = []
+    for raw_chunk in raw_chunks:
+        chunk = _normalize_chunk_text(raw_chunk)
+        if not chunk:
+            continue
+        if chunks and _CLOSING_QUOTE_RE.search(chunks[-1]):
+            prev_chunk = chunks[-1]
+            prev_cjk_chars = sum(1 for char in prev_chunk if _is_cjk_char(char))
+            prev_has_internal_pause = any(
+                punct in prev_chunk for punct in "，、,:：；;。！？?!"
+            )
+            if prev_cjk_chars < 6 and not prev_has_internal_pause:
+                chunks[-1] = prev_chunk + chunk
+                continue
+        chunks.append(chunk)
+
+    return chunks or [text]
+
+
+def _split_tts_content(text, max_chars=120):
+    normalized = _normalize_chunk_text(text)
+    if not normalized:
+        return []
+
+    rough_chunks = []
+    for quote_chunk in _split_quote_tail_chunks(normalized):
+        rough_chunks.extend(
+            chunk for chunk in _STRONG_SENTENCE_SPLIT_RE.split(quote_chunk) if chunk
+        )
     if not rough_chunks:
         rough_chunks = [normalized]
 
@@ -414,55 +1191,102 @@ def _split_tts_content(text, max_chars=80):
         if not rough_chunk:
             continue
 
-        if len(rough_chunk) <= max_chars:
+        rough_cost = _estimate_tts_cost(rough_chunk)
+        ascii_words = len(_ASCII_WORD_RE.findall(rough_chunk))
+        digits = len(_DIGIT_RE.findall(rough_chunk))
+
+        if (
+            len(rough_chunk) <= max_chars
+            and rough_cost <= 165
+            and ascii_words <= 4
+            and digits <= 10
+        ):
             chunks.append(rough_chunk)
             continue
 
-        weak_chunks = [chunk for chunk in _WEAK_SENTENCE_SPLIT_RE.split(rough_chunk) if chunk]
+        sentence_chunks = []
+        if _should_keep_strong_chunk(rough_chunk, max_chars=max_chars):
+            sentence_chunks.append(rough_chunk)
+            chunks.extend(_merge_split_chunks(sentence_chunks, max_chars=max_chars))
+            continue
+
+        weak_chunks = [
+            chunk for chunk in _WEAK_SENTENCE_SPLIT_RE.split(rough_chunk) if chunk
+        ]
         if len(weak_chunks) <= 1:
-            chunks.extend(_split_long_chunk(rough_chunk, max_chars=max_chars))
+            chunks.extend(
+                _merge_split_chunks(
+                    _split_long_chunk(rough_chunk, max_chars=max_chars),
+                    max_chars=max_chars,
+                )
+            )
             continue
 
         current = ""
+        current_cost = 0.0
+        sentence_target_chars = min(
+            max_chars,
+            max(22, len(rough_chunk) // 2 + 6),
+        )
         for weak_chunk in weak_chunks:
             weak_chunk = _normalize_chunk_text(weak_chunk)
             if not weak_chunk:
                 continue
+
+            weak_cost = _estimate_tts_cost(weak_chunk)
             candidate = weak_chunk if not current else current + weak_chunk
-            if len(candidate) <= max_chars:
+            candidate_cost = _estimate_tts_cost(candidate)
+            if len(candidate) <= sentence_target_chars and candidate_cost <= 150:
                 current = candidate
+                current_cost = candidate_cost
+                continue
+
+            # 短片段（< 6 字）併入目前區塊，避免產生孤兒片段造成不自然斷句
+            if (
+                current
+                and len(weak_chunk) < 6
+                and len(candidate) <= max_chars
+                and candidate_cost <= 165
+            ):
+                current = candidate
+                current_cost = candidate_cost
                 continue
 
             if current:
-                chunks.append(current)
-            if len(weak_chunk) <= max_chars:
+                sentence_chunks.append(current)
+            if len(weak_chunk) <= max_chars and weak_cost <= 150:
                 current = weak_chunk
+                current_cost = weak_cost
             else:
-                chunks.extend(_split_long_chunk(weak_chunk, max_chars=max_chars))
+                sentence_chunks.extend(
+                    _split_long_chunk(weak_chunk, max_chars=max_chars)
+                )
                 current = ""
+                current_cost = 0.0
 
         if current:
-            chunks.append(current)
+            sentence_chunks.append(current)
 
-    merged_chunks = []
-    for chunk in chunks:
-        chunk = _normalize_chunk_text(chunk)
-        if not chunk:
-            continue
-        if merged_chunks and len(chunk) < 8 and len(merged_chunks[-1]) + len(chunk) <= max_chars:
-            merged_chunks[-1] += chunk
-        else:
-            merged_chunks.append(chunk)
-    return merged_chunks
+        chunks.extend(
+            _merge_split_chunks(
+                sentence_chunks,
+                max_chars=max(sentence_target_chars + 10, 32),
+            )
+        )
+
+    return [
+        _ensure_sentence_tail(chunk)
+        for chunk in _merge_connective_sentences(chunks, max_chars=max_chars)
+    ]
 
 
 def _pause_samples_for_chunk(text, sample_rate=22050):
     trailing = text[-1] if text else ""
     if trailing in "。！？?!；;":
-        return int(sample_rate * 0.18)
+        return int(sample_rate * 0.15)
     if trailing in "，、,:：":
-        return int(sample_rate * 0.10)
-    return int(sample_rate * 0.06)
+        return int(sample_rate * 0.07)
+    return int(sample_rate * 0.05)
 
 
 def _trim_waveform_silence(
@@ -470,7 +1294,7 @@ def _trim_waveform_silence(
     sample_rate=22050,
     threshold=0.003,
     keep_leading_sec=0.02,
-    keep_trailing_sec=0.04,
+    keep_trailing_sec=0.08,
     trim_leading=True,
     trim_trailing=True,
 ):
@@ -481,7 +1305,11 @@ def _trim_waveform_silence(
         waveform = waveform.unsqueeze(0)
 
     amplitude = waveform.abs().amax(dim=0)
-    voiced_indices = torch.nonzero(amplitude > threshold, as_tuple=False).flatten()
+    peak_amplitude = float(amplitude.max().item()) if amplitude.numel() else 0.0
+    effective_threshold = min(threshold, max(0.0008, peak_amplitude * 0.08))
+    voiced_indices = torch.nonzero(
+        amplitude > effective_threshold, as_tuple=False
+    ).flatten()
     if voiced_indices.numel() == 0:
         return waveform
 
@@ -500,58 +1328,163 @@ def _trim_waveform_silence(
     return waveform[:, start:end]
 
 
-def _append_tail_silence(waveform, sample_rate=22050, tail_sec=0.35):
+def _append_tail_silence(
+    waveform,
+    sample_rate=22050,
+    tail_sec=0.60,
+    release_sec=0.08,
+    keep_existing_tail_sec=0.06,
+    threshold=0.0015,
+):
     if waveform.dim() == 1:
         waveform = waveform.unsqueeze(0)
+
+    if waveform.numel() == 0:
+        return waveform
+
+    amplitude = waveform.abs().amax(dim=0)
+    peak_amplitude = float(amplitude.max().item()) if amplitude.numel() else 0.0
+    effective_threshold = min(threshold, max(0.0008, peak_amplitude * 0.08))
+    voiced_indices = torch.nonzero(
+        amplitude > effective_threshold, as_tuple=False
+    ).flatten()
+    if peak_amplitude > threshold and voiced_indices.numel() > 0:
+        keep_existing_tail = max(1, int(sample_rate * keep_existing_tail_sec))
+        last_voiced = int(voiced_indices[-1].item())
+        existing_tail = max(0, waveform.shape[1] - last_voiced - 1)
+        release_samples = min(
+            max(keep_existing_tail, int(sample_rate * release_sec)),
+            last_voiced + 1,
+        )
+
+        if existing_tail < keep_existing_tail and release_samples > 1:
+            release_start = max(0, last_voiced + 1 - release_samples)
+            release_tail = waveform[:, release_start : last_voiced + 1].clone()
+            fade = torch.linspace(
+                1.0,
+                0.0,
+                steps=release_tail.shape[1],
+                dtype=waveform.dtype,
+                device=waveform.device,
+            ).unsqueeze(0)
+            waveform = torch.cat([waveform, release_tail * fade], dim=1)
+
     tail = torch.zeros(
         (waveform.shape[0], int(sample_rate * tail_sec)),
         dtype=waveform.dtype,
+        device=waveform.device,
     )
     return torch.cat([waveform, tail], dim=1)
 
-def single_inference(speaker_prompt_audio_path, content_to_synthesize, output_path, cosyvoice, bopomofo_converter, speaker_prompt_text_transcription=None):
+
+def single_inference(
+    speaker_prompt_audio_path,
+    content_to_synthesize,
+    output_path,
+    cosyvoice,
+    bopomofo_converter,
+    speaker_prompt_text_transcription=None,
+    content_bopomofo=None,
+    content_bopomofo_inline_markup=None,
+):
     prompt_speech_16k = load_wav(speaker_prompt_audio_path, 16000)
     content_to_synthesize = content_to_synthesize
     output_path = output_path.strip()
 
-    if speaker_prompt_text_transcription:
-        speaker_prompt_text_transcription = speaker_prompt_text_transcription
-    else:
+    # Respect an explicitly provided empty prompt text from batch preprocessing.
+    # Falling back to ASR here can re-introduce noisy prompt text and destabilize
+    # prosody, even when batch_inference intentionally dropped it.
+    if speaker_prompt_text_transcription is None:
         speaker_prompt_text_transcription = transcribe_audio(speaker_prompt_audio_path)
-    
-    
-    
-    ###normalization
-    speaker_prompt_text_transcription = cosyvoice.frontend.text_normalize_new(
-        speaker_prompt_text_transcription, 
-        split=False
-    )
-    content_to_synthesize = cosyvoice.frontend.text_normalize_new(
-        content_to_synthesize, 
-        split=False
-    )
-    speaker_prompt_text_transcription_bopomo = get_bopomofo_rare(speaker_prompt_text_transcription, bopomofo_converter)
-    print("Speaker prompt audio transcription:",speaker_prompt_text_transcription_bopomo)
 
-    content_chunks = _split_tts_content(content_to_synthesize, max_chars=80)
+    ###normalization
+    if speaker_prompt_text_transcription:
+        speaker_prompt_text_transcription = cosyvoice.frontend.text_normalize(
+            speaker_prompt_text_transcription, split=False
+        )
+    else:
+        speaker_prompt_text_transcription = ""
+    preferred_tts_text = _normalize_chunk_text(
+        str(content_bopomofo_inline_markup or "")
+    )
+    if not preferred_tts_text:
+        preferred_tts_text = _build_text_with_external_bopomofo(
+            content_to_synthesize,
+            content_bopomofo,
+        )
+    if not preferred_tts_text:
+        preferred_tts_text = content_to_synthesize
+    content_chunks = cosyvoice.frontend.text_normalize(preferred_tts_text, split=True)
+    content_chunks = _stabilize_frontend_content_chunks(
+        content_chunks,
+        max_chars=_CONSERVATIVE_TTS_CHUNK_MAX_CHARS,
+        min_chars=_CONSERVATIVE_TTS_CHUNK_MIN_CHARS,
+    )
+    speaker_prompt_text_transcription_bopomo = get_bopomofo_rare(
+        speaker_prompt_text_transcription, bopomofo_converter
+    )
+    prompt_text_for_inference = _select_safe_text_variant(
+        cosyvoice.frontend,
+        speaker_prompt_text_transcription_bopomo,
+        speaker_prompt_text_transcription,
+        max_token_len=_MAX_PROMPT_TEXT_TOKEN_LEN,
+        label="prompt_text",
+    )
+
     if not content_chunks:
         raise ValueError("content_to_synthesize is empty after normalization")
 
-    print("Content chunks:", content_chunks)
-    start = time.time()
     chunk_audios = []
     for chunk_index, content_chunk in enumerate(content_chunks, start=1):
-        content_to_synthesize_bopomo = get_bopomofo_rare(content_chunk, bopomofo_converter)
-        print(f"Content chunk {chunk_index}/{len(content_chunks)}:", content_to_synthesize_bopomo)
-        output = cosyvoice.inference_zero_shot_no_normalize(
-            content_to_synthesize_bopomo,
-            speaker_prompt_text_transcription_bopomo,
-            prompt_speech_16k,
-        )
         is_last_chunk = chunk_index == len(content_chunks)
+        if _has_inline_bopomofo_markup(content_chunk):
+            content_to_synthesize_bopomo = content_chunk
+        else:
+            content_to_synthesize_bopomo = get_bopomofo_rare(
+                content_chunk, bopomofo_converter
+            )
+            if not any(char in content_chunk for char in "？?"):
+                content_to_synthesize_bopomo = _augment_chunk_head_pronunciation(
+                    content_to_synthesize_bopomo,
+                    bopomofo_converter,
+                )
+        tts_text_for_inference = _select_safe_text_variant(
+            cosyvoice.frontend,
+            content_to_synthesize_bopomo,
+            content_chunk,
+            max_token_len=_MAX_TTS_TEXT_TOKEN_LEN,
+            label=f"tts_chunk_{chunk_index}",
+        )
+        try:
+            output = cosyvoice.inference_zero_shot_no_normalize(
+                tts_text_for_inference,
+                prompt_text_for_inference,
+                prompt_speech_16k,
+            )
+        except RuntimeError as exc:
+            if not _is_attention_length_mismatch(exc):
+                raise
+            if (
+                tts_text_for_inference == content_chunk
+                and prompt_text_for_inference == speaker_prompt_text_transcription
+            ):
+                raise
+            print(
+                f"retry plain text for chunk {chunk_index} after attention "
+                f"length mismatch: {exc}"
+            )
+            output = cosyvoice.inference_zero_shot_no_normalize(
+                content_chunk,
+                speaker_prompt_text_transcription,
+                prompt_speech_16k,
+            )
+        trim_threshold = 0.0012 if chunk_index == 1 or is_last_chunk else 0.0018
+        keep_leading_sec = 0.14 if chunk_index == 1 else 0.01
         trimmed_chunk = _trim_waveform_silence(
             output["tts_speech"],
-            keep_trailing_sec=0.10 if not is_last_chunk else 0.20,
+            threshold=trim_threshold,
+            keep_leading_sec=keep_leading_sec,
+            keep_trailing_sec=0.22 if not is_last_chunk else 0.55,
             trim_trailing=not is_last_chunk,
         )
         chunk_audios.append(trimmed_chunk)
@@ -563,26 +1496,69 @@ def single_inference(speaker_prompt_audio_path, content_to_synthesize, output_pa
             chunk_audios.append(pause)
 
     output = {"tts_speech": _append_tail_silence(torch.cat(chunk_audios, dim=1))}
-    end = time.time()
-    print("Elapsed time:",end - start)
-    print("Generated audio length:", output['tts_speech'].shape[1]/22050, "seconds")
-    torchaudio.save(output_path, output['tts_speech'], 22050)
-    print(f"Generated voice saved to {output_path}")
+    torchaudio.save(output_path, output["tts_speech"], 22050)
+
 
 def main():
     ####args
-    parser = argparse.ArgumentParser(description="Run BreezyVoice text-to-speech with custom inputs")
-    parser.add_argument("--content_to_synthesize", type=str, required=True, help="Specifies the content that will be synthesized into speech.")
-    parser.add_argument("--speaker_prompt_audio_path", type=str, required=True, help="Specifies the path to the prompt speech audio file of the speaker.")
-    parser.add_argument("--speaker_prompt_text_transcription", type=str, required=False, help="Specifies the transcription of the speaker prompt audio (Highly Recommended, if not provided, the system will fall back to transcribing with Whisper.)")
-    
-    parser.add_argument("--output_path", type=str, required=False, default="results/output.wav", help="Specifies the name and path for the output .wav file.")
-    
-    parser.add_argument("--model_path", type=str, required=False, default = "MediaTek-Research/BreezyVoice-300M",help="Specifies the model used for speech synthesis.")
-    parser.add_argument("--ttsfrd_resource_dir", type=str, required=False, default="", help="Optional path to CosyVoice-ttsfrd/resource.")
+    parser = argparse.ArgumentParser(
+        description="Run BreezyVoice text-to-speech with custom inputs"
+    )
+    parser.add_argument(
+        "--content_to_synthesize",
+        type=str,
+        required=True,
+        help="Specifies the content that will be synthesized into speech.",
+    )
+    parser.add_argument(
+        "--speaker_prompt_audio_path",
+        type=str,
+        required=True,
+        help="Specifies the path to the prompt speech audio file of the speaker.",
+    )
+    parser.add_argument(
+        "--speaker_prompt_text_transcription",
+        type=str,
+        required=False,
+        help="Specifies the transcription of the speaker prompt audio (Highly Recommended, if not provided, the system will fall back to transcribing with Whisper.)",
+    )
+    parser.add_argument(
+        "--content_bopomofo",
+        type=str,
+        required=False,
+        help="Optional bopomofo sequence aligned to the synthesis text.",
+    )
+    parser.add_argument(
+        "--content_bopomofo_inline_markup",
+        type=str,
+        required=False,
+        help="Optional inline bopomofo markup text such as 字[:ㄗˋ].",
+    )
+
+    parser.add_argument(
+        "--output_path",
+        type=str,
+        required=False,
+        default="results/output.wav",
+        help="Specifies the name and path for the output .wav file.",
+    )
+
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        required=False,
+        default="MediaTek-Research/BreezyVoice-300M",
+        help="Specifies the model used for speech synthesis.",
+    )
+    parser.add_argument(
+        "--ttsfrd_resource_dir",
+        type=str,
+        required=False,
+        default="",
+        help="Optional path to CosyVoice-ttsfrd/resource.",
+    )
     args = parser.parse_args()
-    
-    
+
     cosyvoice = CustomCosyVoice(args.model_path, args.ttsfrd_resource_dir)
 
     bopomofo_converter = G2PWConverter()
@@ -590,11 +1566,17 @@ def main():
     speaker_prompt_audio_path = args.speaker_prompt_audio_path
     content_to_synthesize = args.content_to_synthesize
     output_path = args.output_path.strip()
-    single_inference(speaker_prompt_audio_path, content_to_synthesize, output_path, cosyvoice, bopomofo_converter, args.speaker_prompt_text_transcription)
+    single_inference(
+        speaker_prompt_audio_path,
+        content_to_synthesize,
+        output_path,
+        cosyvoice,
+        bopomofo_converter,
+        args.speaker_prompt_text_transcription,
+        args.content_bopomofo,
+        args.content_bopomofo_inline_markup,
+    )
+
 
 if __name__ == "__main__":
     main()
-
-
-
-
