@@ -258,8 +258,6 @@ class CustomCosyVoiceModel(CosyVoiceModel):
             embedding=llm_embedding.to(self.device),
             beam_size=1,
             sampling=25,
-            max_token_text_ratio=30,
-            min_token_text_ratio=3,
         )
 
         # input()
@@ -773,8 +771,11 @@ _MAX_AUGMENTED_TOKEN_RATIO = 3.0
 _SHORT_CHINESE_SENTENCE_CHARS = 80
 _DEFAULT_TTS_CHUNK_MAX_CHARS = 120
 _UNPUNCTUATED_TTS_CHUNK_MAX_CHARS = 180
-_CONSERVATIVE_TTS_CHUNK_MAX_CHARS = 60
+_CONSERVATIVE_TTS_CHUNK_MAX_CHARS = 120
 _CONSERVATIVE_TTS_CHUNK_MIN_CHARS = 14
+_LONG_FORM_TTS_CHUNK_MAX_CHARS = 150
+_LONG_FORM_CONSERVATIVE_CHUNK_MAX_CHARS = 140
+_LONG_FORM_CONSERVATIVE_CHUNK_MIN_CHARS = 20
 
 
 def _normalize_chunk_text(text):
@@ -793,6 +794,53 @@ def _has_pause_punctuation(text):
     if not normalized:
         return False
     return any(char in normalized for char in "。！？?!；;，、,:：")
+
+
+def _is_long_form_dense_text(text):
+    normalized = _normalize_chunk_text(text)
+    if not normalized or not contains_chinese(normalized):
+        return False
+
+    text_len = len(normalized)
+    if text_len < 110:
+        return False
+
+    strong_punct_count = sum(normalized.count(char) for char in "。！？?!；;")
+    weak_punct_count = sum(normalized.count(char) for char in "，、,:：")
+    quote_count = sum(normalized.count(char) for char in "「」『』“”\"")
+    return (
+        strong_punct_count >= 2
+        or weak_punct_count >= 6
+        or (quote_count >= 4 and weak_punct_count >= 3)
+    )
+
+
+def _resolve_tts_chunk_limits(text):
+    if _is_long_form_dense_text(text):
+        return (
+            _LONG_FORM_TTS_CHUNK_MAX_CHARS,
+            _LONG_FORM_CONSERVATIVE_CHUNK_MAX_CHARS,
+            _LONG_FORM_CONSERVATIVE_CHUNK_MIN_CHARS,
+        )
+    return (
+        _DEFAULT_TTS_CHUNK_MAX_CHARS,
+        _CONSERVATIVE_TTS_CHUNK_MAX_CHARS,
+        _CONSERVATIVE_TTS_CHUNK_MIN_CHARS,
+    )
+
+
+def _is_short_fragment_chunk(text):
+    normalized = _normalize_chunk_text(text)
+    if not normalized:
+        return False
+    return contains_chinese(normalized) and len(normalized) <= 34
+
+
+def _is_brief_final_sentence_chunk(text):
+    normalized = _normalize_chunk_text(text)
+    if not normalized or not contains_chinese(normalized):
+        return False
+    return len(normalized) <= 14 and normalized[-1] in "。！？?!；;"
 
 
 def _get_text_token_length(frontend, text):
@@ -1125,7 +1173,7 @@ def _split_chunk_conservatively(text, max_chars=60, min_chars=14):
     )
 
 
-def _stabilize_frontend_content_chunks(chunks, max_chars=60, min_chars=14):
+def _stabilize_frontend_content_chunks(chunks, max_chars=120, min_chars=14):
     stabilized_chunks = []
     for chunk in chunks:
         chunk = _normalize_chunk_text(chunk)
@@ -1142,6 +1190,35 @@ def _stabilize_frontend_content_chunks(chunks, max_chars=60, min_chars=14):
             continue
         stabilized_chunks.append(chunk)
     return stabilized_chunks
+
+
+def _resolve_content_chunks(frontend, preferred_tts_text):
+    if _has_inline_bopomofo_markup(preferred_tts_text):
+        normalized_text = preferred_tts_text
+    else:
+        normalized_text = frontend.text_normalize(preferred_tts_text, split=False)
+    normalized_text = _normalize_chunk_text(normalized_text)
+    if not normalized_text:
+        return []
+
+    (
+        chunk_max_chars,
+        conservative_max_chars,
+        conservative_min_chars,
+    ) = _resolve_tts_chunk_limits(normalized_text)
+
+    content_chunks = _split_tts_content(
+        normalized_text,
+        max_chars=chunk_max_chars,
+    )
+    if not content_chunks:
+        content_chunks = [normalized_text]
+
+    return _stabilize_frontend_content_chunks(
+        content_chunks,
+        max_chars=conservative_max_chars,
+        min_chars=conservative_min_chars,
+    )
 
 
 def _split_quote_tail_chunks(text):
@@ -1282,11 +1359,69 @@ def _split_tts_content(text, max_chars=120):
 
 def _pause_samples_for_chunk(text, sample_rate=22050):
     trailing = text[-1] if text else ""
+    if _is_short_fragment_chunk(text):
+        if trailing in "。！？?!；;":
+            return int(sample_rate * 0.055)
+        if trailing in "，、,:：":
+            return int(sample_rate * 0.02)
+        return int(sample_rate * 0.012)
     if trailing in "。！？?!；;":
-        return int(sample_rate * 0.15)
+        return int(sample_rate * 0.09)
     if trailing in "，、,:：":
-        return int(sample_rate * 0.07)
-    return int(sample_rate * 0.05)
+        return int(sample_rate * 0.035)
+    return int(sample_rate * 0.015)
+
+
+def _chunk_keep_trailing_sec(text, is_last_chunk):
+    trailing = text[-1] if text else ""
+    if _is_short_fragment_chunk(text):
+        if is_last_chunk:
+            if _is_brief_final_sentence_chunk(text):
+                if trailing in "。！？?!；;":
+                    return 0.2
+                if trailing in "，、,:：":
+                    return 0.12
+                return 0.1
+            if trailing in "。！？?!；;":
+                return 0.05
+            if trailing in "，、,:：":
+                return 0.035
+            return 0.03
+        if trailing in "。！？?!；;":
+            return 0.075
+        if trailing in "，、,:：":
+            return 0.05
+        return 0.04
+    if is_last_chunk:
+        if trailing in "。！？?!；;":
+            return 0.06
+        if trailing in "，、,:：":
+            return 0.045
+        return 0.035
+    if trailing in "。！？?!；;":
+        return 0.12
+    if trailing in "，、,:：":
+        return 0.08
+    return 0.05
+
+
+def _resolve_speed_scale(speed_scale):
+    try:
+        resolved = float(speed_scale)
+    except (TypeError, ValueError):
+        return 1.0
+    return min(max(resolved, 0.7), 1.3)
+
+
+def _apply_speed_scale(waveform, sample_rate, speed_scale):
+    resolved_speed = _resolve_speed_scale(speed_scale)
+    if waveform.numel() == 0 or abs(resolved_speed - 1.0) < 1e-4:
+        return waveform
+
+    target_sample_rate = max(8000, int(round(sample_rate / resolved_speed)))
+    if target_sample_rate == sample_rate:
+        return waveform
+    return F.resample(waveform, sample_rate, target_sample_rate)
 
 
 def _trim_waveform_silence(
@@ -1331,10 +1466,8 @@ def _trim_waveform_silence(
 def _append_tail_silence(
     waveform,
     sample_rate=22050,
-    tail_sec=0.60,
-    release_sec=0.08,
-    keep_existing_tail_sec=0.06,
-    threshold=0.0015,
+    tail_sec=0.28,
+    fade_out_sec=0.02,
 ):
     if waveform.dim() == 1:
         waveform = waveform.unsqueeze(0)
@@ -1342,32 +1475,17 @@ def _append_tail_silence(
     if waveform.numel() == 0:
         return waveform
 
-    amplitude = waveform.abs().amax(dim=0)
-    peak_amplitude = float(amplitude.max().item()) if amplitude.numel() else 0.0
-    effective_threshold = min(threshold, max(0.0008, peak_amplitude * 0.08))
-    voiced_indices = torch.nonzero(
-        amplitude > effective_threshold, as_tuple=False
-    ).flatten()
-    if peak_amplitude > threshold and voiced_indices.numel() > 0:
-        keep_existing_tail = max(1, int(sample_rate * keep_existing_tail_sec))
-        last_voiced = int(voiced_indices[-1].item())
-        existing_tail = max(0, waveform.shape[1] - last_voiced - 1)
-        release_samples = min(
-            max(keep_existing_tail, int(sample_rate * release_sec)),
-            last_voiced + 1,
-        )
-
-        if existing_tail < keep_existing_tail and release_samples > 1:
-            release_start = max(0, last_voiced + 1 - release_samples)
-            release_tail = waveform[:, release_start : last_voiced + 1].clone()
-            fade = torch.linspace(
-                1.0,
-                0.0,
-                steps=release_tail.shape[1],
-                dtype=waveform.dtype,
-                device=waveform.device,
-            ).unsqueeze(0)
-            waveform = torch.cat([waveform, release_tail * fade], dim=1)
+    fade_samples = min(int(sample_rate * fade_out_sec), waveform.shape[1])
+    if fade_samples > 1:
+        fade = torch.linspace(
+            1.0,
+            0.0,
+            steps=fade_samples,
+            dtype=waveform.dtype,
+            device=waveform.device,
+        ).unsqueeze(0)
+        waveform = waveform.clone()
+        waveform[:, -fade_samples:] = waveform[:, -fade_samples:] * fade
 
     tail = torch.zeros(
         (waveform.shape[0], int(sample_rate * tail_sec)),
@@ -1375,6 +1493,276 @@ def _append_tail_silence(
         device=waveform.device,
     )
     return torch.cat([waveform, tail], dim=1)
+
+
+def _trim_final_tail_artifact(
+    waveform,
+    sample_rate=22050,
+    max_trim_sec=0.35,
+    keep_padding_sec=0.01,
+    threshold_ratio=0.01,
+):
+    if waveform.numel() == 0:
+        return waveform
+    if waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)
+
+    amplitude = waveform.abs().amax(dim=0)
+    if amplitude.numel() == 0:
+        return waveform
+
+    peak = float(amplitude.max().item())
+    if peak <= 1e-8:
+        return waveform
+
+    frame_samples = max(1, int(round(sample_rate * 0.012)))
+    if frame_samples > 1:
+        smoothed = torch.nn.functional.avg_pool1d(
+            amplitude.view(1, 1, -1),
+            kernel_size=frame_samples,
+            stride=1,
+            padding=frame_samples // 2,
+        ).view(-1)
+        if smoothed.shape[0] > amplitude.shape[0]:
+            smoothed = smoothed[: amplitude.shape[0]]
+    else:
+        smoothed = amplitude
+
+    threshold = max(7e-5, peak * float(threshold_ratio))
+    active_indices = torch.nonzero(smoothed >= threshold, as_tuple=False).flatten()
+    if active_indices.numel() == 0:
+        return waveform
+
+    last_active = int(active_indices[-1].item())
+    keep_padding = int(round(float(keep_padding_sec) * sample_rate))
+    max_trim = int(round(float(max_trim_sec) * sample_rate))
+    min_end_index = max(0, waveform.shape[1] - max_trim - 1)
+    target_end_index = min(waveform.shape[1] - 1, last_active + keep_padding)
+    final_end_index = max(min_end_index, target_end_index)
+    if final_end_index >= waveform.shape[1] - 1:
+        return waveform
+    return waveform[:, : final_end_index + 1]
+
+
+def _chunk_trim_threshold(text, is_last_chunk):
+    if not is_last_chunk:
+        return 0.0018
+    if _is_brief_final_sentence_chunk(text):
+        trailing = text[-1] if text else ""
+        if trailing in "。！？?!；;":
+            return 0.0015
+        if trailing in "，、,:：":
+            return 0.0014
+        return 0.0014
+    trailing = text[-1] if text else ""
+    if trailing in "。！？?!；;":
+        return 0.0028
+    if trailing in "，、,:：":
+        return 0.0025
+    return 0.0023
+
+
+def _resolve_chunk_trim_threshold(text, *, chunk_index, chunk_count):
+    is_last_chunk = chunk_index == chunk_count
+    if chunk_count == 1 and _is_brief_final_sentence_chunk(text):
+        return 0.0009
+    if chunk_index == 1:
+        return 0.0012
+    return _chunk_trim_threshold(text, is_last_chunk)
+
+
+def _resolve_final_tail_trim_config(text):
+    if _is_brief_final_sentence_chunk(text):
+        return {
+            "enabled": False,
+        }
+    if _is_short_fragment_chunk(text):
+        return {
+            "enabled": True,
+            "max_trim_sec": 0.4,
+            "keep_padding_sec": 0.012,
+            "threshold_ratio": 0.015,
+        }
+    return {
+        "enabled": True,
+        "max_trim_sec": 0.45,
+        "keep_padding_sec": 0.006,
+        "threshold_ratio": 0.018,
+    }
+
+
+def _resolve_tail_append_config(text):
+    if _is_brief_final_sentence_chunk(text):
+        return {
+            "tail_sec": 0.34,
+            "fade_out_sec": 0.0,
+        }
+    if _is_short_fragment_chunk(text):
+        return {
+            "tail_sec": 0.3,
+            "fade_out_sec": 0.012,
+        }
+    return {
+        "tail_sec": 0.28,
+        "fade_out_sec": 0.02,
+    }
+
+
+def _get_detached_brief_sentence_tail_region(
+    waveform,
+    sample_rate=22050,
+    *,
+    threshold_ratio=0.012,
+    min_gap_sec=0.02,
+    max_gap_sec=0.12,
+    min_tail_region_sec=0.02,
+    max_tail_region_sec=0.1,
+    min_primary_region_sec=0.4,
+    min_tail_start_ratio=0.82,
+):
+    if waveform.numel() == 0:
+        return None
+    if waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)
+
+    amplitude = waveform.abs().amax(dim=0)
+    if amplitude.numel() == 0:
+        return None
+
+    peak = float(amplitude.max().item())
+    if peak <= 1e-8:
+        return None
+
+    frame_samples = max(1, int(round(sample_rate * 0.01)))
+    if frame_samples > 1:
+        smoothed = torch.nn.functional.avg_pool1d(
+            amplitude.view(1, 1, -1),
+            kernel_size=frame_samples,
+            stride=1,
+            padding=frame_samples // 2,
+        ).view(-1)
+        if smoothed.shape[0] > amplitude.shape[0]:
+            smoothed = smoothed[: amplitude.shape[0]]
+    else:
+        smoothed = amplitude
+
+    threshold = max(7e-5, peak * float(threshold_ratio))
+    active_indices = torch.nonzero(smoothed >= threshold, as_tuple=False).flatten()
+    if active_indices.numel() < 2:
+        return None
+
+    regions = []
+    region_start = int(active_indices[0].item())
+    region_end = int(active_indices[0].item())
+    for idx in active_indices[1:]:
+        idx = int(idx.item())
+        if idx <= region_end + 1:
+            region_end = idx
+            continue
+        regions.append((region_start, region_end))
+        region_start = idx
+        region_end = idx
+    regions.append((region_start, region_end))
+    if len(regions) < 2:
+        return None
+
+    primary_start, primary_end = regions[-2]
+    tail_start, tail_end = regions[-1]
+    primary_region_sec = float(primary_end - primary_start + 1) / float(sample_rate)
+    tail_region_sec = float(tail_end - tail_start + 1) / float(sample_rate)
+    gap_sec = float(tail_start - primary_end - 1) / float(sample_rate)
+    tail_start_ratio = float(tail_start) / float(waveform.shape[1])
+
+    if primary_region_sec < float(min_primary_region_sec):
+        return None
+    if gap_sec < float(min_gap_sec) or gap_sec > float(max_gap_sec):
+        return None
+    if tail_region_sec < float(min_tail_region_sec):
+        return None
+    if tail_region_sec > float(max_tail_region_sec):
+        return None
+    if tail_start_ratio < float(min_tail_start_ratio):
+        return None
+    return tail_start, tail_end
+
+
+def _has_detached_brief_sentence_tail(
+    waveform,
+    sample_rate=22050,
+    **kwargs,
+):
+    return (
+        _get_detached_brief_sentence_tail_region(
+            waveform,
+            sample_rate=sample_rate,
+            **kwargs,
+        )
+        is not None
+    )
+
+
+def _append_detached_brief_sentence_tail_release(
+    waveform,
+    sample_rate=22050,
+    *,
+    peak_lead_in_sec=0.012,
+    release_sec=0.055,
+):
+    region = _get_detached_brief_sentence_tail_region(
+        waveform,
+        sample_rate=sample_rate,
+    )
+    if region is None:
+        return waveform
+    if waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)
+
+    tail_start, tail_end = region
+    tail_region = waveform[:, tail_start : tail_end + 1]
+    if tail_region.shape[1] < 8:
+        return waveform
+
+    tail_amplitude = tail_region.abs().amax(dim=0)
+    peak_offset = int(torch.argmax(tail_amplitude).item())
+    peak_lead_in_samples = max(4, int(round(float(peak_lead_in_sec) * sample_rate)))
+    source_start_offset = max(0, peak_offset - peak_lead_in_samples)
+    source = tail_region[:, source_start_offset:]
+    if source.shape[1] < 8:
+        return waveform
+
+    release_samples = max(source.shape[1], int(round(float(release_sec) * sample_rate)))
+    release = torch.nn.functional.interpolate(
+        source.unsqueeze(0),
+        size=release_samples,
+        mode="linear",
+        align_corners=False,
+    ).squeeze(0)
+    fade = torch.linspace(
+        0.92,
+        0.0,
+        steps=release_samples,
+        dtype=release.dtype,
+        device=release.device,
+    ).unsqueeze(0)
+    release = release * fade
+    return torch.cat([waveform, release], dim=1)
+
+
+def _resolve_effective_chunk_speed_scale(
+    text,
+    speed_scale,
+    *,
+    chunk_count,
+    waveform=None,
+):
+    resolved_speed = _resolve_speed_scale(speed_scale)
+    if chunk_count != 1 or not _is_brief_final_sentence_chunk(text):
+        return resolved_speed
+    if resolved_speed <= 1.0:
+        return resolved_speed
+    if waveform is not None and _has_detached_brief_sentence_tail(waveform):
+        return 1.0
+    return min(resolved_speed, 1.02)
 
 
 def single_inference(
@@ -1386,6 +1774,8 @@ def single_inference(
     speaker_prompt_text_transcription=None,
     content_bopomofo=None,
     content_bopomofo_inline_markup=None,
+    enable_auto_bopomofo=True,
+    speed_scale=1.0,
 ):
     prompt_speech_16k = load_wav(speaker_prompt_audio_path, 16000)
     content_to_synthesize = content_to_synthesize
@@ -1414,11 +1804,9 @@ def single_inference(
         )
     if not preferred_tts_text:
         preferred_tts_text = content_to_synthesize
-    content_chunks = cosyvoice.frontend.text_normalize(preferred_tts_text, split=True)
-    content_chunks = _stabilize_frontend_content_chunks(
-        content_chunks,
-        max_chars=_CONSERVATIVE_TTS_CHUNK_MAX_CHARS,
-        min_chars=_CONSERVATIVE_TTS_CHUNK_MIN_CHARS,
+    content_chunks = _resolve_content_chunks(
+        cosyvoice.frontend,
+        preferred_tts_text,
     )
     speaker_prompt_text_transcription_bopomo = get_bopomofo_rare(
         speaker_prompt_text_transcription, bopomofo_converter
@@ -1438,8 +1826,8 @@ def single_inference(
     for chunk_index, content_chunk in enumerate(content_chunks, start=1):
         is_last_chunk = chunk_index == len(content_chunks)
         if _has_inline_bopomofo_markup(content_chunk):
-            content_to_synthesize_bopomo = content_chunk
-        else:
+            tts_text_for_inference = content_chunk
+        elif enable_auto_bopomofo:
             content_to_synthesize_bopomo = get_bopomofo_rare(
                 content_chunk, bopomofo_converter
             )
@@ -1448,13 +1836,15 @@ def single_inference(
                     content_to_synthesize_bopomo,
                     bopomofo_converter,
                 )
-        tts_text_for_inference = _select_safe_text_variant(
-            cosyvoice.frontend,
-            content_to_synthesize_bopomo,
-            content_chunk,
-            max_token_len=_MAX_TTS_TEXT_TOKEN_LEN,
-            label=f"tts_chunk_{chunk_index}",
-        )
+            tts_text_for_inference = _select_safe_text_variant(
+                cosyvoice.frontend,
+                content_to_synthesize_bopomo,
+                content_chunk,
+                max_token_len=_MAX_TTS_TEXT_TOKEN_LEN,
+                label=f"tts_chunk_{chunk_index}",
+            )
+        else:
+            tts_text_for_inference = content_chunk
         try:
             output = cosyvoice.inference_zero_shot_no_normalize(
                 tts_text_for_inference,
@@ -1478,14 +1868,29 @@ def single_inference(
                 speaker_prompt_text_transcription,
                 prompt_speech_16k,
             )
-        trim_threshold = 0.0012 if chunk_index == 1 or is_last_chunk else 0.0018
+        trim_threshold = _resolve_chunk_trim_threshold(
+            content_chunk,
+            chunk_index=chunk_index,
+            chunk_count=len(content_chunks),
+        )
         keep_leading_sec = 0.14 if chunk_index == 1 else 0.01
         trimmed_chunk = _trim_waveform_silence(
             output["tts_speech"],
             threshold=trim_threshold,
             keep_leading_sec=keep_leading_sec,
-            keep_trailing_sec=0.22 if not is_last_chunk else 0.55,
-            trim_trailing=not is_last_chunk,
+            keep_trailing_sec=_chunk_keep_trailing_sec(content_chunk, is_last_chunk),
+            trim_trailing=True,
+        )
+        effective_chunk_speed_scale = _resolve_effective_chunk_speed_scale(
+            content_chunk,
+            speed_scale,
+            chunk_count=len(content_chunks),
+            waveform=trimmed_chunk,
+        )
+        trimmed_chunk = _apply_speed_scale(
+            trimmed_chunk,
+            22050,
+            effective_chunk_speed_scale,
         )
         chunk_audios.append(trimmed_chunk)
         if not is_last_chunk:
@@ -1495,7 +1900,28 @@ def single_inference(
             )
             chunk_audios.append(pause)
 
-    output = {"tts_speech": _append_tail_silence(torch.cat(chunk_audios, dim=1))}
+    final_waveform = torch.cat(chunk_audios, dim=1)
+    if len(content_chunks) == 1 and _is_brief_final_sentence_chunk(content_chunks[-1]):
+        final_waveform = _append_detached_brief_sentence_tail_release(
+            final_waveform,
+            sample_rate=22050,
+        )
+    final_tail_trim_cfg = _resolve_final_tail_trim_config(content_chunks[-1])
+    if final_tail_trim_cfg.get("enabled", True):
+        final_waveform = _trim_final_tail_artifact(
+            final_waveform,
+            max_trim_sec=final_tail_trim_cfg["max_trim_sec"],
+            keep_padding_sec=final_tail_trim_cfg["keep_padding_sec"],
+            threshold_ratio=final_tail_trim_cfg["threshold_ratio"],
+        )
+    tail_append_cfg = _resolve_tail_append_config(content_chunks[-1])
+    output = {
+        "tts_speech": _append_tail_silence(
+            final_waveform,
+            tail_sec=tail_append_cfg["tail_sec"],
+            fade_out_sec=tail_append_cfg["fade_out_sec"],
+        )
+    }
     torchaudio.save(output_path, output["tts_speech"], 22050)
 
 
@@ -1557,6 +1983,20 @@ def main():
         default="",
         help="Optional path to CosyVoice-ttsfrd/resource.",
     )
+    parser.add_argument(
+        "--enable_auto_bopomofo",
+        type=str,
+        required=False,
+        default="1",
+        help="Whether to auto-generate bopomofo guidance when external guidance is absent.",
+    )
+    parser.add_argument(
+        "--speed_scale",
+        type=float,
+        required=False,
+        default=1.0,
+        help="Speech speed scaling factor.",
+    )
     args = parser.parse_args()
 
     cosyvoice = CustomCosyVoice(args.model_path, args.ttsfrd_resource_dir)
@@ -1575,6 +2015,11 @@ def main():
         args.speaker_prompt_text_transcription,
         args.content_bopomofo,
         args.content_bopomofo_inline_markup,
+        enable_auto_bopomofo=(
+            str(args.enable_auto_bopomofo).strip().lower()
+            not in {"0", "false", "no", "off"}
+        ),
+        speed_scale=float(args.speed_scale),
     )
 
 

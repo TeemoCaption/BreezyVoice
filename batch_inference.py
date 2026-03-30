@@ -132,6 +132,13 @@ def _preprocess_csv_rows(rows):
             or str(row.get("content_inline_bopomofo_markup", "") or ""),
             preserve_bopomofo_markup=True,
         )
+        enable_auto_bopomofo = str(
+            row.get("enable_auto_bopomofo", "1") or "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        try:
+            speed_scale = float(row.get("speed_scale", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            speed_scale = 1.0
         if not content_text or (not _VALID_TTS_CONTENT_RE.search(content_text)):
             dropped_rows += 1
             continue
@@ -145,6 +152,8 @@ def _preprocess_csv_rows(rows):
                 "content_to_synthesize": content_text,
                 "content_bopomofo": content_bopomofo,
                 "content_bopomofo_inline_markup": content_bopomofo_inline_markup,
+                "enable_auto_bopomofo": enable_auto_bopomofo,
+                "speed_scale": speed_scale,
                 "output_audio_filename": str(
                     row.get("output_audio_filename", "") or ""
                 ).strip(),
@@ -193,6 +202,8 @@ def process_batch(
         content_bopomofo_inline_markup = str(
             row.get("content_bopomofo_inline_markup", "") or ""
         )
+        enable_auto_bopomofo = bool(row.get("enable_auto_bopomofo", True))
+        speed_scale = float(row.get("speed_scale", 1.0) or 1.0)
         output_audio_path = os.path.join(
             output_audio_folder, f"{row['output_audio_filename']}.wav"
         )
@@ -222,6 +233,8 @@ def process_batch(
             speaker_prompt_text_transcription,
             content_bopomofo,
             content_bopomofo_inline_markup,
+            enable_auto_bopomofo=enable_auto_bopomofo,
+            speed_scale=speed_scale,
         )
         processed_count += 1
         print(f"\r[{processed_count}/{total_rows}]", end="", flush=True)

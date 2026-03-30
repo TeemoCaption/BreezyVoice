@@ -22,8 +22,20 @@ import torchaudio
 import os
 import re
 import inflect
-from tn.chinese.normalizer import Normalizer as ZhNormalizer
-from tn.english.normalizer import Normalizer as EnNormalizer
+try:
+    from tn.chinese.normalizer import Normalizer as ZhNormalizer
+    from tn.english.normalizer import Normalizer as EnNormalizer
+    _HAS_WETEXT_TN = True
+except ModuleNotFoundError:
+    _HAS_WETEXT_TN = False
+
+    class _IdentityNormalizer:
+
+        def normalize(self, text):
+            return text
+
+    ZhNormalizer = _IdentityNormalizer
+    EnNormalizer = _IdentityNormalizer
 from cosyvoice.utils.frontend_utils import contains_chinese, replace_blank, replace_corner_mark, remove_bracket, spell_out_number, split_paragraph
 
 use_ttsfrd = False
@@ -32,6 +44,13 @@ use_ttsfrd = False
 def _build_wetext_normalizers():
     return (
         ZhNormalizer(remove_erhua=False, full_to_half=False),
+        EnNormalizer(),
+    )
+
+
+def _build_fallback_normalizers():
+    return (
+        ZhNormalizer(),
         EnNormalizer(),
     )
 
@@ -61,7 +80,10 @@ class CosyVoiceFrontEnd:
         self.instruct = instruct
         self.allowed_special = allowed_special
         self.inflect_parser = inflect.engine()
-        self.zh_tn_model, self.en_tn_model = _build_wetext_normalizers()
+        if _HAS_WETEXT_TN:
+            self.zh_tn_model, self.en_tn_model = _build_wetext_normalizers()
+        else:
+            self.zh_tn_model, self.en_tn_model = _build_fallback_normalizers()
         self.use_ttsfrd = use_ttsfrd
 
     def _extract_text_token(self, text):
