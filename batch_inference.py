@@ -54,7 +54,11 @@ _CJK_ASCII_PUNCT_TRANSLATION = str.maketrans(
 )
 
 
-def _clean_batch_text(text: str, preserve_bopomofo_markup: bool = False) -> str:
+def _clean_batch_text(
+    text: str,
+    preserve_bopomofo_markup: bool = False,
+    drop_ascii_noise: bool = False,
+) -> str:
     if not isinstance(text, str):
         return ""
     cleaned = text.translate(_INVISIBLE_CHARS)
@@ -63,21 +67,22 @@ def _clean_batch_text(text: str, preserve_bopomofo_markup: bool = False) -> str:
         cleaned = _PLACEHOLDER_TAG_RE.sub(" ", cleaned)
     cleaned = _REPEATED_SYMBOL_RE.sub(" ", cleaned)
     cleaned = _REPEATED_HYPHEN_RE.sub(" ", cleaned)
-    cleaned = _STRUCTURAL_BREAK_RE.sub("。", cleaned)
+    cleaned = _STRUCTURAL_BREAK_RE.sub(" ", cleaned)
     cleaned = _WHITESPACE_RE.sub(" ", cleaned).strip()
     cleaned = _COMMON_INSTRUCTION_PREFIX_RE.sub("", cleaned)
     cleaned = _COLON_BEFORE_STRONG_PUNCT_RE.sub(r"\1", cleaned)
     if _CJK_CHAR_RE.search(cleaned):
         # Drop embedded ASCII runs inside Chinese text to avoid English-like
         # prompt leakage such as FIREFOXONANDROID/CREDIT affecting synthesis.
-        cleaned = _ASCII_NOISE_RUN_RE.sub(" ", cleaned)
+        if drop_ascii_noise:
+            cleaned = _ASCII_NOISE_RUN_RE.sub(" ", cleaned)
         cleaned = cleaned.translate(_CJK_ASCII_PUNCT_TRANSLATION)
         cleaned = _CJK_SPACE_RE.sub("", cleaned)
         cleaned = _CJK_PUNCT_SPACE_RE.sub("", cleaned)
         cleaned = _PUNCT_CJK_SPACE_RE.sub("", cleaned)
         if _CJK_SPACED_TEXT_RE.search(cleaned):
             cleaned = cleaned.replace(" ", "")
-    else:
+    elif drop_ascii_noise:
         cleaned = _NOISY_UPPER_TOKEN_RE.sub(" ", cleaned)
     cleaned = _REPEATED_WEAK_PUNCT_RE.sub(r"\1", cleaned)
     cleaned = _REPEATED_STRONG_PUNCT_RE.sub(r"\1", cleaned)
@@ -99,7 +104,7 @@ def _clean_batch_bopomofo_text(text: str) -> str:
 
 
 def _should_drop_prompt_text(text: str) -> bool:
-    cleaned = _clean_batch_text(text)
+    cleaned = _clean_batch_text(text, drop_ascii_noise=True)
     if not cleaned:
         return True
     if not _VALID_TTS_CONTENT_RE.search(cleaned):
@@ -116,7 +121,8 @@ def _preprocess_csv_rows(rows):
     dropped_rows = 0
     for row in rows:
         prompt_text = _clean_batch_text(
-            str(row.get("speaker_prompt_text_transcription", "") or "")
+            str(row.get("speaker_prompt_text_transcription", "") or ""),
+            drop_ascii_noise=True,
         )
         if _should_drop_prompt_text(prompt_text):
             prompt_text = ""
@@ -131,6 +137,7 @@ def _preprocess_csv_rows(rows):
             str(row.get("content_bopomofo_inline_markup", "") or "")
             or str(row.get("content_inline_bopomofo_markup", "") or ""),
             preserve_bopomofo_markup=True,
+            drop_ascii_noise=False,
         )
         enable_auto_bopomofo = str(
             row.get("enable_auto_bopomofo", "1") or "1"

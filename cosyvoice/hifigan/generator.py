@@ -16,7 +16,6 @@
 
 import typing as tp
 import numpy as np
-from scipy.signal import get_window
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -311,7 +310,7 @@ class HiFTGenerator(nn.Module):
         self.ups.apply(init_weights)
         self.conv_post.apply(init_weights)
         self.reflection_pad = nn.ReflectionPad1d((1, 0))
-        self.stft_window = torch.from_numpy(get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32))
+        self.stft_window = torch.hann_window(istft_params["n_fft"])
         self.f0_predictor = f0_predictor
 
     def _f02source(self, f0: torch.Tensor) -> torch.Tensor:
