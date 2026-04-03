@@ -1,2 +1,10 @@
 __pycache__/
 *.py[cod]
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+tmp/
+temp/
+.tmp/
+.temp/
