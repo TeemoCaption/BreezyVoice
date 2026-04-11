@@ -279,7 +279,6 @@ def main():
         default="",
         help="Optional path to CosyVoice-ttsfrd/resource.",
     )
-
     args = parser.parse_args()
 
     cosyvoice = CustomCosyVoice(args.model_path, args.ttsfrd_resource_dir)

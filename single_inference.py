@@ -672,6 +672,33 @@ def _contains_bopomofo_text(text):
     )
 
 
+def _longest_connected_cjk_span(text):
+    longest = 0
+    current = 0
+    for char in str(text or ""):
+        if _is_cjk_char(char):
+            current += 1
+            if current > longest:
+                longest = current
+            continue
+        current = 0
+    return longest
+
+
+def _should_preserve_phrase_prosody_for_external_bopomofo(text):
+    normalized_text = _normalize_chunk_text(text)
+    if not normalized_text or not contains_chinese(normalized_text):
+        return False
+
+    # 逐字外掛注音會讓連續中文詞組的韻律變得很碎。
+    # 對大多數中文句子，寧可保留原句，交給 auto bopomofo / 稀有字標記
+    # 做較少量的引導，也不要把整句轉成每字一個 markup。
+    longest_connected_span = _longest_connected_cjk_span(normalized_text)
+    if longest_connected_span >= 4:
+        return True
+    return len(normalized_text) >= 10
+
+
 def _build_text_with_external_bopomofo(text, bopomofo):
     normalized_text = _normalize_chunk_text(text)
     normalized_bopomofo = _MULTISPACE_RE.sub(" ", str(bopomofo or "")).strip()
@@ -679,6 +706,8 @@ def _build_text_with_external_bopomofo(text, bopomofo):
         return normalized_text
     if _has_inline_bopomofo_markup(normalized_bopomofo):
         return normalized_bopomofo
+    if _should_preserve_phrase_prosody_for_external_bopomofo(normalized_text):
+        return normalized_text
 
     bopomofo_tokens = [token for token in normalized_bopomofo.split(" ") if token]
     if not bopomofo_tokens:
@@ -756,6 +785,7 @@ _CLOSING_QUOTE_RE = re.compile(r'[”」』"]$')
 _LEADING_CONNECTIVE_RE = re.compile(
     r"^(比喻|例如|比如|所以|因此|也就是|換句話說|意思是)"
 )
+_LEADING_ENUMERATION_RE = re.compile(r"^[零一二三四五六七八九十百\d]+、")
 _CJK_PUNCT_TRANSLATION = str.maketrans(
     {
         ",": "，",
@@ -807,7 +837,7 @@ def _is_long_form_dense_text(text):
 
     strong_punct_count = sum(normalized.count(char) for char in "。！？?!；;")
     weak_punct_count = sum(normalized.count(char) for char in "，、,:：")
-    quote_count = sum(normalized.count(char) for char in "「」『』“”\"")
+    quote_count = sum(normalized.count(char) for char in '「」『』“”"')
     return (
         strong_punct_count >= 2
         or weak_punct_count >= 6
@@ -829,6 +859,20 @@ def _resolve_tts_chunk_limits(text):
     )
 
 
+def _tighten_long_form_chunk_limit(max_chars):
+    try:
+        resolved = int(max_chars)
+    except (TypeError, ValueError):
+        return None
+    if resolved <= 0:
+        return None
+
+    # 長而密的條列句即使已經按標點切分，仍可能在片段內尾端回捲。
+    # 這裡再收緊一點上限，讓分段更保守一些。
+    tightened = int(round(resolved * 0.8))
+    return max(_LONG_FORM_CONSERVATIVE_CHUNK_MIN_CHARS, min(resolved, tightened))
+
+
 def _is_short_fragment_chunk(text):
     normalized = _normalize_chunk_text(text)
     if not normalized:
@@ -841,6 +885,44 @@ def _is_brief_final_sentence_chunk(text):
     if not normalized or not contains_chinese(normalized):
         return False
     return len(normalized) <= 14 and normalized[-1] in "。！？?!；;"
+
+
+def _is_short_chinese_question_chunk(text):
+    normalized = _normalize_chunk_text(text)
+    if not normalized or not contains_chinese(normalized):
+        return False
+    if normalized[-1] not in "？?":
+        return False
+
+    text_body = normalized[:-1].strip()
+    if not text_body:
+        return False
+    if len(text_body) > 9:
+        return False
+    if any(ch in text_body for ch in "。！!？?；;，、,:："):
+        return False
+
+    cjk_chars = sum(1 for char in text_body if _is_cjk_char(char))
+    return cjk_chars >= 4
+
+
+def _should_preserve_final_tail_clause(text):
+    normalized = _normalize_chunk_text(text)
+    if not normalized or not contains_chinese(normalized):
+        return False
+
+    trailing = normalized[-1]
+    text_body = normalized[:-1] if trailing in "。！？?!；;，、,:：" else normalized
+    if not text_body:
+        return False
+    if len(normalized) > 24:
+        return False
+
+    # 對沒有句內停頓的短中文單句，句尾常會出現較輕的收尾音。
+    # 這類尾音若再做最終尾端裁切，很容易把最後 2 到 4 個字直接削掉。
+    if _has_brief_final_weak_clause(normalized):
+        return True
+    return not any(ch in text_body for ch in "。！？?!；;，、,:：")
 
 
 def _get_text_token_length(frontend, text):
@@ -919,6 +1001,8 @@ def _estimate_tts_cost(text):
 def _should_keep_strong_chunk(text, max_chars=120):
     text = _normalize_chunk_text(text)
     if not text:
+        return False
+    if _should_force_conservative_subsplit(text, max_chars=max_chars):
         return False
 
     text_len = len(text)
@@ -1192,7 +1276,7 @@ def _stabilize_frontend_content_chunks(chunks, max_chars=120, min_chars=14):
     return stabilized_chunks
 
 
-def _resolve_content_chunks(frontend, preferred_tts_text):
+def _resolve_content_chunks(frontend, preferred_tts_text, max_chunk_chars=None):
     if _has_inline_bopomofo_markup(preferred_tts_text):
         normalized_text = preferred_tts_text
     else:
@@ -1206,6 +1290,16 @@ def _resolve_content_chunks(frontend, preferred_tts_text):
         conservative_max_chars,
         conservative_min_chars,
     ) = _resolve_tts_chunk_limits(normalized_text)
+
+    requested_max_chunk_chars = _resolve_requested_max_chunk_chars(max_chunk_chars)
+    if requested_max_chunk_chars is not None:
+        chunk_max_chars = min(chunk_max_chars, requested_max_chunk_chars)
+        conservative_max_chars = min(conservative_max_chars, requested_max_chunk_chars)
+        if _is_long_form_dense_text(normalized_text):
+            chunk_max_chars = _tighten_long_form_chunk_limit(chunk_max_chars)
+            conservative_max_chars = _tighten_long_form_chunk_limit(
+                conservative_max_chars
+            )
 
     content_chunks = _split_tts_content(
         normalized_text,
@@ -1271,12 +1365,17 @@ def _split_tts_content(text, max_chars=120):
         rough_cost = _estimate_tts_cost(rough_chunk)
         ascii_words = len(_ASCII_WORD_RE.findall(rough_chunk))
         digits = len(_DIGIT_RE.findall(rough_chunk))
+        force_conservative_subsplit = _should_force_conservative_subsplit(
+            rough_chunk,
+            max_chars=max_chars,
+        )
 
         if (
             len(rough_chunk) <= max_chars
             and rough_cost <= 165
             and ascii_words <= 4
             and digits <= 10
+            and not force_conservative_subsplit
         ):
             chunks.append(rough_chunk)
             continue
@@ -1299,18 +1398,31 @@ def _split_tts_content(text, max_chars=120):
             )
             continue
 
+        preserve_final_tail_chunk = _has_brief_final_weak_clause(rough_chunk)
         current = ""
         current_cost = 0.0
         sentence_target_chars = min(
             max_chars,
             max(22, len(rough_chunk) // 2 + 6),
         )
-        for weak_chunk in weak_chunks:
+        if force_conservative_subsplit:
+            sentence_target_chars = min(
+                sentence_target_chars,
+                max(12, int(round(len(rough_chunk) * 0.62))),
+            )
+        for weak_index, weak_chunk in enumerate(weak_chunks):
             weak_chunk = _normalize_chunk_text(weak_chunk)
             if not weak_chunk:
                 continue
 
             weak_cost = _estimate_tts_cost(weak_chunk)
+            is_final_weak_chunk = weak_index == len(weak_chunks) - 1
+            if preserve_final_tail_chunk and is_final_weak_chunk and current:
+                sentence_chunks.append(current)
+                current = weak_chunk
+                current_cost = weak_cost
+                continue
+
             candidate = weak_chunk if not current else current + weak_chunk
             candidate_cost = _estimate_tts_cost(candidate)
             if len(candidate) <= sentence_target_chars and candidate_cost <= 150:
@@ -1344,10 +1456,22 @@ def _split_tts_content(text, max_chars=120):
         if current:
             sentence_chunks.append(current)
 
+        merge_max_chars = max(sentence_target_chars + 10, 32)
+        if force_conservative_subsplit:
+            merge_max_chars = max(12, sentence_target_chars)
+        if preserve_final_tail_chunk and len(sentence_chunks) >= 2:
+            chunks.extend(
+                _merge_split_chunks(
+                    sentence_chunks[:-1],
+                    max_chars=merge_max_chars,
+                )
+            )
+            chunks.append(sentence_chunks[-1])
+            continue
         chunks.extend(
             _merge_split_chunks(
                 sentence_chunks,
-                max_chars=max(sentence_target_chars + 10, 32),
+                max_chars=merge_max_chars,
             )
         )
 
@@ -1374,6 +1498,12 @@ def _pause_samples_for_chunk(text, sample_rate=22050):
 
 def _chunk_keep_trailing_sec(text, is_last_chunk):
     trailing = text[-1] if text else ""
+    if _is_brief_final_sentence_chunk(text) and not is_last_chunk:
+        if trailing in "。！？?!；;":
+            return 0.16
+        if trailing in "，、,:：":
+            return 0.1
+        return 0.08
     if _is_short_fragment_chunk(text):
         if is_last_chunk:
             if _is_brief_final_sentence_chunk(text):
@@ -1383,21 +1513,21 @@ def _chunk_keep_trailing_sec(text, is_last_chunk):
                     return 0.12
                 return 0.1
             if trailing in "。！？?!；;":
-                return 0.05
+                return 0.08
             if trailing in "，、,:：":
-                return 0.035
-            return 0.03
+                return 0.055
+            return 0.045
+        if trailing in "。！？?!；;":
+            return 0.08
+        if trailing in "，、,:：":
+            return 0.055
+        return 0.045
+    if is_last_chunk:
         if trailing in "。！？?!；;":
             return 0.075
         if trailing in "，、,:：":
-            return 0.05
-        return 0.04
-    if is_last_chunk:
-        if trailing in "。！？?!；;":
-            return 0.06
-        if trailing in "，、,:：":
-            return 0.045
-        return 0.035
+            return 0.055
+        return 0.045
     if trailing in "。！？?!；;":
         return 0.12
     if trailing in "，、,:：":
@@ -1461,6 +1591,205 @@ def _trim_waveform_silence(
         end = waveform.shape[1]
 
     return waveform[:, start:end]
+
+
+def _resolve_internal_silence_compression_config(text, *, chunk_count):
+    normalized = _normalize_chunk_text(text)
+    if not normalized:
+        return {
+            "enabled": False,
+        }
+
+    config = {
+        "enabled": True,
+        "threshold_ratio": 0.006,
+        "smoothing_window_sec": 0.012,
+        "max_internal_silence_sec": 0.28,
+        "target_internal_silence_sec": 0.09,
+        "min_region_sec": 0.08,
+        "min_side_region_sec": 0.12,
+        "max_compressions": 1,
+    }
+
+    text_body = (
+        normalized[:-1] if normalized[-1] in "。！？?!；;，、,:：" else normalized
+    )
+    has_weak_pause = any(ch in text_body for ch in "，、,:：")
+
+    if has_weak_pause:
+        return {
+            "enabled": False,
+        }
+
+    if normalized[-1] in "？?":
+        config.update(
+            {
+                "max_internal_silence_sec": min(
+                    config["max_internal_silence_sec"], 0.22
+                ),
+                "target_internal_silence_sec": 0.08,
+                "min_side_region_sec": max(config["min_side_region_sec"], 0.14),
+            }
+        )
+
+    if _is_short_fragment_chunk(normalized):
+        config.update(
+            {
+                "max_internal_silence_sec": min(
+                    config["max_internal_silence_sec"], 0.2
+                ),
+                "target_internal_silence_sec": min(
+                    config["target_internal_silence_sec"], 0.075
+                ),
+                "min_region_sec": max(config["min_region_sec"], 0.1),
+                "min_side_region_sec": max(config["min_side_region_sec"], 0.16),
+            }
+        )
+
+    if chunk_count == 1 and _should_preserve_final_tail_clause(normalized):
+        config.update(
+            {
+                "enabled": False,
+            }
+        )
+
+    return config
+
+
+def _compress_internal_silence(
+    waveform,
+    sample_rate=22050,
+    *,
+    threshold_ratio=0.006,
+    smoothing_window_sec=0.012,
+    max_internal_silence_sec=0.16,
+    target_internal_silence_sec=0.055,
+    min_region_sec=0.05,
+    min_side_region_sec=0.08,
+    max_compressions=1,
+):
+    if waveform.numel() == 0:
+        return waveform
+    if waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)
+
+    amplitude = waveform.abs().amax(dim=0)
+    if amplitude.numel() == 0:
+        return waveform
+
+    peak = float(amplitude.max().item())
+    if peak <= 1e-8:
+        return waveform
+
+    frame_samples = max(1, int(round(float(smoothing_window_sec) * sample_rate)))
+    if frame_samples > 1:
+        smoothed = torch.nn.functional.avg_pool1d(
+            amplitude.view(1, 1, -1),
+            kernel_size=frame_samples,
+            stride=1,
+            padding=frame_samples // 2,
+        ).view(-1)
+        if smoothed.shape[0] > amplitude.shape[0]:
+            smoothed = smoothed[: amplitude.shape[0]]
+    else:
+        smoothed = amplitude
+
+    threshold = max(7e-5, peak * float(threshold_ratio))
+    active_indices = torch.nonzero(smoothed >= threshold, as_tuple=False).flatten()
+    if active_indices.numel() < 2:
+        return waveform
+
+    regions = []
+    region_start = int(active_indices[0].item())
+    region_end = int(active_indices[0].item())
+    for idx in active_indices[1:]:
+        idx = int(idx.item())
+        if idx <= region_end + 1:
+            region_end = idx
+            continue
+        regions.append((region_start, region_end))
+        region_start = idx
+        region_end = idx
+    regions.append((region_start, region_end))
+
+    if len(regions) < 2:
+        return waveform
+
+    max_gap_samples = max(1, int(round(float(max_internal_silence_sec) * sample_rate)))
+    target_gap_samples = max(
+        0,
+        min(
+            max_gap_samples,
+            int(round(float(target_internal_silence_sec) * sample_rate)),
+        ),
+    )
+    min_region_samples = max(1, int(round(float(min_region_sec) * sample_rate)))
+    min_side_region_samples = max(
+        1, int(round(float(min_side_region_sec) * sample_rate))
+    )
+
+    compression_budget = max(0, int(max_compressions))
+    if compression_budget == 0:
+        return waveform
+
+    candidate_gap_lengths = []
+    for region_index in range(1, len(regions)):
+        prev_start, prev_end = regions[region_index - 1]
+        current_start, current_end = regions[region_index]
+        gap_length = current_start - prev_end - 1
+        prev_region_length = prev_end - prev_start + 1
+        current_region_length = current_end - current_start + 1
+        if (
+            gap_length > max_gap_samples
+            and gap_length > target_gap_samples
+            and prev_region_length >= min_region_samples
+            and current_region_length >= min_region_samples
+            and prev_region_length >= min_side_region_samples
+            and current_region_length >= min_side_region_samples
+        ):
+            candidate_gap_lengths.append((gap_length, region_index))
+
+    if not candidate_gap_lengths:
+        return waveform
+
+    compress_region_indices = {
+        region_index
+        for _, region_index in sorted(candidate_gap_lengths, reverse=True)[
+            :compression_budget
+        ]
+    }
+
+    changed = False
+    rebuilt_segments = [waveform[:, : regions[0][1] + 1]]
+
+    for region_index in range(1, len(regions)):
+        prev_start, prev_end = regions[region_index - 1]
+        current_start, current_end = regions[region_index]
+        gap_start = prev_end + 1
+        gap_end = current_start
+        gap_length = current_start - prev_end - 1
+        prev_region_length = prev_end - prev_start + 1
+        current_region_length = current_end - current_start + 1
+
+        should_compress = region_index in compress_region_indices
+
+        if should_compress:
+            silence = torch.zeros(
+                (waveform.shape[0], target_gap_samples),
+                dtype=waveform.dtype,
+                device=waveform.device,
+            )
+            rebuilt_segments.append(silence)
+            changed = True
+        else:
+            rebuilt_segments.append(waveform[:, gap_start:gap_end])
+
+        rebuilt_segments.append(waveform[:, current_start : current_end + 1])
+
+    rebuilt_segments.append(waveform[:, regions[-1][1] + 1 :])
+    if not changed:
+        return waveform
+    return torch.cat(rebuilt_segments, dim=1)
 
 
 def _append_tail_silence(
@@ -1545,15 +1874,21 @@ def _trim_final_tail_artifact(
 
 
 def _chunk_trim_threshold(text, is_last_chunk):
-    if not is_last_chunk:
-        return 0.0018
     if _is_brief_final_sentence_chunk(text):
         trailing = text[-1] if text else ""
+        if not is_last_chunk:
+            if trailing in "。！？?!；;":
+                return 0.0011
+            if trailing in "，、,:：":
+                return 0.00105
+            return 0.00105
         if trailing in "。！？?!；;":
             return 0.0015
         if trailing in "，、,:：":
             return 0.0014
         return 0.0014
+    if not is_last_chunk:
+        return 0.0018
     trailing = text[-1] if text else ""
     if trailing in "。！？?!；;":
         return 0.0028
@@ -1576,35 +1911,44 @@ def _resolve_final_tail_trim_config(text):
         return {
             "enabled": False,
         }
+    if _should_preserve_final_tail_clause(text):
+        return {
+            "enabled": False,
+        }
     if _is_short_fragment_chunk(text):
         return {
             "enabled": True,
-            "max_trim_sec": 0.4,
-            "keep_padding_sec": 0.012,
-            "threshold_ratio": 0.015,
+            "max_trim_sec": 0.32,
+            "keep_padding_sec": 0.02,
+            "threshold_ratio": 0.011,
         }
     return {
         "enabled": True,
-        "max_trim_sec": 0.45,
-        "keep_padding_sec": 0.006,
-        "threshold_ratio": 0.018,
+        "max_trim_sec": 0.38,
+        "keep_padding_sec": 0.01,
+        "threshold_ratio": 0.014,
     }
 
 
 def _resolve_tail_append_config(text):
     if _is_brief_final_sentence_chunk(text):
         return {
-            "tail_sec": 0.34,
+            "tail_sec": 0.36,
+            "fade_out_sec": 0.0,
+        }
+    if _should_preserve_final_tail_clause(text):
+        return {
+            "tail_sec": 0.36,
             "fade_out_sec": 0.0,
         }
     if _is_short_fragment_chunk(text):
         return {
-            "tail_sec": 0.3,
-            "fade_out_sec": 0.012,
+            "tail_sec": 0.34,
+            "fade_out_sec": 0.01,
         }
     return {
-        "tail_sec": 0.28,
-        "fade_out_sec": 0.02,
+        "tail_sec": 0.3,
+        "fade_out_sec": 0.018,
     }
 
 
@@ -1705,8 +2049,8 @@ def _append_detached_brief_sentence_tail_release(
     waveform,
     sample_rate=22050,
     *,
-    peak_lead_in_sec=0.012,
-    release_sec=0.055,
+    peak_lead_in_sec=0.01,
+    release_sec=0.04,
 ):
     region = _get_detached_brief_sentence_tail_region(
         waveform,
@@ -1756,6 +2100,8 @@ def _resolve_effective_chunk_speed_scale(
     waveform=None,
 ):
     resolved_speed = _resolve_speed_scale(speed_scale)
+    if _is_short_chinese_question_chunk(text) and resolved_speed > 1.0:
+        return 1.0
     if chunk_count != 1 or not _is_brief_final_sentence_chunk(text):
         return resolved_speed
     if resolved_speed <= 1.0:
@@ -1763,6 +2109,98 @@ def _resolve_effective_chunk_speed_scale(
     if waveform is not None and _has_detached_brief_sentence_tail(waveform):
         return 1.0
     return min(resolved_speed, 1.02)
+
+
+def _resolve_requested_max_chunk_chars(max_chunk_chars):
+    try:
+        resolved = int(max_chunk_chars)
+    except (TypeError, ValueError):
+        return None
+    if resolved <= 0:
+        return None
+    return max(24, resolved)
+
+
+def _effective_chunk_text_length(text):
+    normalized = _normalize_chunk_text(text)
+    if not normalized:
+        return 0
+    normalized = _BOPOMOFO_MARK_RE.sub("", normalized)
+    return sum(1 for char in normalized if char not in "。！？?!；;，、,:： ")
+
+
+def _split_internal_weak_clause_spans(text):
+    normalized = _normalize_chunk_text(text)
+    if not normalized:
+        return []
+    body = normalized[:-1] if normalized[-1] in "。！？?!；;" else normalized
+    return [
+        segment.strip()
+        for segment in _WEAK_SENTENCE_SPLIT_RE.split(body)
+        if segment and segment.strip()
+    ]
+
+
+def _has_brief_final_weak_clause(text):
+    normalized = _normalize_chunk_text(text)
+    if not normalized or not contains_chinese(normalized):
+        return False
+
+    spans = _split_internal_weak_clause_spans(normalized)
+    if len(spans) < 2:
+        return False
+
+    weak_punct_count = sum(normalized.count(char) for char in "，、,:：")
+    if weak_punct_count <= 0:
+        return False
+
+    if weak_punct_count < 2 and len(spans) < 3:
+        return False
+
+    total_len = _effective_chunk_text_length(normalized)
+    if total_len < 18 or total_len > 42:
+        return False
+
+    tail_len = _effective_chunk_text_length(spans[-1])
+    head_len = sum(_effective_chunk_text_length(span) for span in spans[:-1])
+    tail_limit = max(3, min(6, int(round(total_len * 0.28))))
+    return tail_len > 0 and tail_len <= tail_limit and head_len >= max(10, tail_len + 3)
+
+
+def _is_weak_punctuation_dense_sentence(text):
+    normalized = _normalize_chunk_text(text)
+    if not normalized or not contains_chinese(normalized):
+        return False
+
+    body = normalized[:-1] if normalized[-1] in "。！？?!；;" else normalized
+    if not body:
+        return False
+
+    weak_punct_count = sum(body.count(char) for char in "，、,:：")
+    effective_len = _effective_chunk_text_length(body)
+    if effective_len < 18:
+        return False
+    if weak_punct_count >= 5:
+        return True
+    if weak_punct_count >= 4 and effective_len >= 22:
+        return True
+    return (
+        weak_punct_count >= 3
+        and effective_len >= 18
+        and bool(_LEADING_ENUMERATION_RE.match(body))
+    )
+
+
+def _should_force_conservative_subsplit(text, max_chars=120):
+    normalized = _normalize_chunk_text(text)
+    if not normalized or not contains_chinese(normalized):
+        return False
+    effective_len = _effective_chunk_text_length(normalized)
+    if effective_len <= 14:
+        return False
+    return _is_weak_punctuation_dense_sentence(
+        normalized
+    ) or _has_brief_final_weak_clause(normalized) or _is_long_form_dense_text(normalized)
 
 
 def single_inference(
@@ -1776,6 +2214,7 @@ def single_inference(
     content_bopomofo_inline_markup=None,
     enable_auto_bopomofo=True,
     speed_scale=1.0,
+    max_chunk_chars=None,
 ):
     prompt_speech_16k = load_wav(speaker_prompt_audio_path, 16000)
     content_to_synthesize = content_to_synthesize
@@ -1807,6 +2246,7 @@ def single_inference(
     content_chunks = _resolve_content_chunks(
         cosyvoice.frontend,
         preferred_tts_text,
+        max_chunk_chars=max_chunk_chars,
     )
     speaker_prompt_text_transcription_bopomo = get_bopomofo_rare(
         speaker_prompt_text_transcription, bopomofo_converter
@@ -1825,9 +2265,10 @@ def single_inference(
     chunk_audios = []
     for chunk_index, content_chunk in enumerate(content_chunks, start=1):
         is_last_chunk = chunk_index == len(content_chunks)
+        force_question_chunk_guidance = _is_short_chinese_question_chunk(content_chunk)
         if _has_inline_bopomofo_markup(content_chunk):
             tts_text_for_inference = content_chunk
-        elif enable_auto_bopomofo:
+        elif enable_auto_bopomofo or force_question_chunk_guidance:
             content_to_synthesize_bopomo = get_bopomofo_rare(
                 content_chunk, bopomofo_converter
             )
@@ -1873,7 +2314,7 @@ def single_inference(
             chunk_index=chunk_index,
             chunk_count=len(content_chunks),
         )
-        keep_leading_sec = 0.14 if chunk_index == 1 else 0.01
+        keep_leading_sec = 0.08 if chunk_index == 1 else 0.01
         trimmed_chunk = _trim_waveform_silence(
             output["tts_speech"],
             threshold=trim_threshold,
@@ -1892,6 +2333,26 @@ def single_inference(
             22050,
             effective_chunk_speed_scale,
         )
+        internal_silence_cfg = _resolve_internal_silence_compression_config(
+            content_chunk,
+            chunk_count=len(content_chunks),
+        )
+        if internal_silence_cfg.get("enabled", True):
+            trimmed_chunk = _compress_internal_silence(
+                trimmed_chunk,
+                sample_rate=22050,
+                threshold_ratio=internal_silence_cfg["threshold_ratio"],
+                smoothing_window_sec=internal_silence_cfg["smoothing_window_sec"],
+                max_internal_silence_sec=internal_silence_cfg[
+                    "max_internal_silence_sec"
+                ],
+                target_internal_silence_sec=internal_silence_cfg[
+                    "target_internal_silence_sec"
+                ],
+                min_region_sec=internal_silence_cfg["min_region_sec"],
+                min_side_region_sec=internal_silence_cfg["min_side_region_sec"],
+                max_compressions=internal_silence_cfg["max_compressions"],
+            )
         chunk_audios.append(trimmed_chunk)
         if not is_last_chunk:
             pause = torch.zeros(
@@ -1901,7 +2362,11 @@ def single_inference(
             chunk_audios.append(pause)
 
     final_waveform = torch.cat(chunk_audios, dim=1)
-    if len(content_chunks) == 1 and _is_brief_final_sentence_chunk(content_chunks[-1]):
+    if (
+        len(content_chunks) == 1
+        and _is_brief_final_sentence_chunk(content_chunks[-1])
+        and (not _is_short_fragment_chunk(content_chunks[-1]))
+    ):
         final_waveform = _append_detached_brief_sentence_tail_release(
             final_waveform,
             sample_rate=22050,
@@ -1997,6 +2462,13 @@ def main():
         default=1.0,
         help="Speech speed scaling factor.",
     )
+    parser.add_argument(
+        "--max_chunk_chars",
+        type=int,
+        required=False,
+        default=0,
+        help="Optional hard cap for per-chunk text length.",
+    )
     args = parser.parse_args()
 
     cosyvoice = CustomCosyVoice(args.model_path, args.ttsfrd_resource_dir)
@@ -2020,6 +2492,7 @@ def main():
             not in {"0", "false", "no", "off"}
         ),
         speed_scale=float(args.speed_scale),
+        max_chunk_chars=args.max_chunk_chars,
     )
 
 
