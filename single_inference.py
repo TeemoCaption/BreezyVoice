@@ -215,25 +215,12 @@ class CustomCosyVoiceFrontEnd(CosyVoiceFrontEnd):
 
 
 ####model
+def _is_cudnn_not_initialized_error(exc):
+    return "CUDNN_STATUS_NOT_INITIALIZED" in str(exc).upper()
+
+
 class CustomCosyVoiceModel(CosyVoiceModel):
-
-    def __init__(
-        self, llm: torch.nn.Module, flow: torch.nn.Module, hift: torch.nn.Module
-    ):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.llm = llm
-        self.flow = flow
-        self.hift = hift
-
-    def load(self, llm_model, flow_model, hift_model):
-        self.llm.load_state_dict(torch.load(llm_model, map_location=self.device))
-        self.llm.to(self.device).eval()
-        self.flow.load_state_dict(torch.load(flow_model, map_location=self.device))
-        self.flow.to(self.device).eval()
-        self.hift.load_state_dict(torch.load(hift_model, map_location=self.device))
-        self.hift.to(self.device).eval()
-
-    def inference(
+    def _run_inference_once(
         self,
         text,
         text_len,
@@ -247,7 +234,7 @@ class CustomCosyVoiceModel(CosyVoiceModel):
         flow_prompt_speech_token_len=torch.zeros(1, dtype=torch.int32),
         prompt_speech_feat=torch.zeros(1, 0, 80),
         prompt_speech_feat_len=torch.zeros(1, dtype=torch.int32),
-    ):
+        ):
         tts_speech_token = self.llm.inference(
             text=text.to(self.device),
             text_len=text_len.to(self.device),
@@ -277,6 +264,65 @@ class CustomCosyVoiceModel(CosyVoiceModel):
         torch.cuda.empty_cache()
         return {"tts_speech": tts_speech}
 
+    def inference(
+        self,
+        text,
+        text_len,
+        flow_embedding,
+        llm_embedding=torch.zeros(0, 192),
+        prompt_text=torch.zeros(1, 0, dtype=torch.int32),
+        prompt_text_len=torch.zeros(1, dtype=torch.int32),
+        llm_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32),
+        llm_prompt_speech_token_len=torch.zeros(1, dtype=torch.int32),
+        flow_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32),
+        flow_prompt_speech_token_len=torch.zeros(1, dtype=torch.int32),
+        prompt_speech_feat=torch.zeros(1, 0, 80),
+        prompt_speech_feat_len=torch.zeros(1, dtype=torch.int32),
+    ):
+        try:
+            return self._run_inference_once(
+                text,
+                text_len,
+                flow_embedding,
+                llm_embedding=llm_embedding,
+                prompt_text=prompt_text,
+                prompt_text_len=prompt_text_len,
+                llm_prompt_speech_token=llm_prompt_speech_token,
+                llm_prompt_speech_token_len=llm_prompt_speech_token_len,
+                flow_prompt_speech_token=flow_prompt_speech_token,
+                flow_prompt_speech_token_len=flow_prompt_speech_token_len,
+                prompt_speech_feat=prompt_speech_feat,
+                prompt_speech_feat_len=prompt_speech_feat_len,
+            )
+        except RuntimeError as exc:
+            if not _is_cudnn_not_initialized_error(exc) or self.device.type != "cuda":
+                raise
+            cudnn_backend = getattr(torch.backends, "cudnn", None)
+            if cudnn_backend is None or not hasattr(cudnn_backend, "enabled"):
+                raise
+            print("偵測到顯示卡卷積加速初始化失敗，暫時關閉後重試。")
+            original_enabled = cudnn_backend.enabled
+            try:
+                # 只在這一次重試關閉卷積加速，避免單筆資料直接被跳過。
+                cudnn_backend.enabled = False
+                torch.cuda.empty_cache()
+                return self._run_inference_once(
+                    text,
+                    text_len,
+                    flow_embedding,
+                    llm_embedding=llm_embedding,
+                    prompt_text=prompt_text,
+                    prompt_text_len=prompt_text_len,
+                    llm_prompt_speech_token=llm_prompt_speech_token,
+                    llm_prompt_speech_token_len=llm_prompt_speech_token_len,
+                    flow_prompt_speech_token=flow_prompt_speech_token,
+                    flow_prompt_speech_token_len=flow_prompt_speech_token_len,
+                    prompt_speech_feat=prompt_speech_feat,
+                    prompt_speech_feat_len=prompt_speech_feat_len,
+                )
+            finally:
+                cudnn_backend.enabled = original_enabled
+
 
 ###CosyVoice
 class CustomCosyVoice:
@@ -303,7 +349,9 @@ class CustomCosyVoice:
             instruct,
             configs["allowed_special"],
         )
-        self.model = CosyVoiceModel(configs["llm"], configs["flow"], configs["hift"])
+        self.model = CustomCosyVoiceModel(
+            configs["llm"], configs["flow"], configs["hift"]
+        )
         self.model.load(
             "{}/llm.pt".format(model_dir),
             "{}/flow.pt".format(model_dir),
@@ -876,7 +924,23 @@ def _is_short_fragment_chunk(text):
     normalized = _normalize_chunk_text(text)
     if not normalized:
         return False
-    return contains_chinese(normalized) and len(normalized) <= 34
+    return (
+        contains_chinese(normalized)
+        and len(normalized) <= 34
+        and not _is_enumeration_item_chunk(normalized)
+    )
+
+
+def _is_enumeration_item_chunk(text):
+    normalized = _normalize_chunk_text(text)
+    if not normalized or not contains_chinese(normalized):
+        return False
+
+    body = normalized[:-1] if normalized[-1] in "。！？?!；;" else normalized
+    if not _LEADING_ENUMERATION_RE.match(body):
+        return False
+
+    return _effective_chunk_text_length(body) > 0
 
 
 def _is_brief_final_sentence_chunk(text):
@@ -1691,7 +1755,9 @@ def _resolve_internal_silence_compression_config(text, *, chunk_count):
             }
         )
 
-    if _is_short_fragment_chunk(normalized):
+    if _is_short_fragment_chunk(normalized) and not _is_enumeration_item_chunk(
+        normalized
+    ):
         config.update(
             {
                 "max_internal_silence_sec": min(
