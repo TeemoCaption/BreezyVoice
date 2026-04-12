@@ -867,9 +867,8 @@ def _tighten_long_form_chunk_limit(max_chars):
     if resolved <= 0:
         return None
 
-    # 長而密的條列句即使已經按標點切分，仍可能在片段內尾端回捲。
-    # 這裡再收緊一點上限，讓分段更保守一些。
-    tightened = int(round(resolved * 0.8))
+    # 只做小幅收緊，避免把本來能完整念完的中長句切得太碎。
+    tightened = int(round(resolved * 0.95))
     return max(_LONG_FORM_CONSERVATIVE_CHUNK_MIN_CHARS, min(resolved, tightened))
 
 
@@ -904,6 +903,35 @@ def _is_short_chinese_question_chunk(text):
 
     cjk_chars = sum(1 for char in text_body if _is_cjk_char(char))
     return cjk_chars >= 4
+
+
+def _has_question_followup_clause(text, *, chunk_limit=None):
+    normalized = _normalize_chunk_text(text)
+    if not normalized:
+        return False
+    if chunk_limit is not None:
+        try:
+            if len(normalized) > int(chunk_limit):
+                return False
+        except (TypeError, ValueError):
+            return False
+
+    body = normalized[:-1] if normalized[-1] in "。！？.!?；;" else normalized
+    if not body:
+        return False
+    if not any(ch in body for ch in "？?"):
+        return False
+
+    strong_punct = "。！？.!?；;"
+    if any((ch in strong_punct) and ch not in "？?" for ch in body):
+        return False
+
+    question_pos = max(body.rfind("？"), body.rfind("?"))
+    if question_pos < 0:
+        return False
+
+    tail = body[question_pos + 1 :].strip()
+    return bool(tail)
 
 
 def _should_preserve_final_tail_clause(text):
@@ -1348,6 +1376,21 @@ def _split_tts_content(text, max_chars=120):
     if not normalized:
         return []
 
+    # 問號後面如果還有接續內容，且整句仍在上限內，就先保留整句。
+    # 這樣可以避免強標點先切成兩段，後面再疊出過長停頓。
+    if max_chars is not None:
+        try:
+            resolved_max_chars = int(max_chars)
+        except (TypeError, ValueError):
+            resolved_max_chars = None
+        else:
+            if resolved_max_chars > 0 and len(normalized) <= resolved_max_chars:
+                if _has_question_followup_clause(
+                    normalized,
+                    chunk_limit=resolved_max_chars,
+                ):
+                    return [normalized]
+
     rough_chunks = []
     for quote_chunk in _split_quote_tail_chunks(normalized):
         rough_chunks.extend(
@@ -1408,7 +1451,7 @@ def _split_tts_content(text, max_chars=120):
         if force_conservative_subsplit:
             sentence_target_chars = min(
                 sentence_target_chars,
-                max(12, int(round(len(rough_chunk) * 0.62))),
+                max(14, int(round(len(rough_chunk) * 0.7))),
             )
         for weak_index, weak_chunk in enumerate(weak_chunks):
             weak_chunk = _normalize_chunk_text(weak_chunk)
@@ -1615,11 +1658,27 @@ def _resolve_internal_silence_compression_config(text, *, chunk_count):
         normalized[:-1] if normalized[-1] in "。！？?!；;，、,:：" else normalized
     )
     has_weak_pause = any(ch in text_body for ch in "，、,:：")
+    has_question_followup_clause = _has_question_followup_clause(normalized)
 
     if has_weak_pause:
         return {
             "enabled": False,
         }
+
+    if has_question_followup_clause:
+        config.update(
+            {
+                # 問號後還有接續內容時，保留一點比較像人在說話的停頓。
+                # 仍保留壓縮機制，避免再次出現過長空白。
+                "max_internal_silence_sec": max(
+                    config["max_internal_silence_sec"], 0.45
+                ),
+                "target_internal_silence_sec": max(
+                    config["target_internal_silence_sec"], 0.16
+                ),
+                "min_side_region_sec": min(config["min_side_region_sec"], 0.1),
+            }
+        )
 
     if normalized[-1] in "？?":
         config.update(
@@ -2100,6 +2159,8 @@ def _resolve_effective_chunk_speed_scale(
     waveform=None,
 ):
     resolved_speed = _resolve_speed_scale(speed_scale)
+    if chunk_count == 1 and _has_question_followup_clause(text) and resolved_speed > 1.0:
+        return 1.0
     if _is_short_chinese_question_chunk(text) and resolved_speed > 1.0:
         return 1.0
     if chunk_count != 1 or not _is_brief_final_sentence_chunk(text):
@@ -2197,6 +2258,9 @@ def _should_force_conservative_subsplit(text, max_chars=120):
         return False
     effective_len = _effective_chunk_text_length(normalized)
     if effective_len <= 14:
+        return False
+    conservative_trigger_len = max(48, int(round(max_chars * 0.9)))
+    if effective_len < conservative_trigger_len:
         return False
     return _is_weak_punctuation_dense_sentence(
         normalized
